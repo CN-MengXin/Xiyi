@@ -47,44 +47,14 @@ impl TypeChecker {
         m.functions.iter().find(|f| f.name == FORWARD)
     }
 
-    // 主入口：只关心"找出 sensitivity 属性的值"
+    // 主入口：只关心"找出 sensitivity 属性的值"。查属性、查
+    // key=value 参数、有理数转 f64 这三步的通用工具挪到了 check_attr.rs
+    // 的 find_attr/find_key_value_arg/rational_arg_to_f64，这里只是
+    // 按 model 领域自己的属性名/键名（SENSITIVITY_ATTR/CONST_KEY）串起来调用。
     fn const_sensitivity(forward: &FnDef) -> Option<f64> {
-        let attr = Self::find_sensitivity_attr(forward)?;
-        let val = Self::find_const_value_in_attr(attr)?;
+        let attr = Self::find_attr(&forward.attributes, SENSITIVITY_ATTR)?;
+        let val = Self::find_key_value_arg(attr, CONST_KEY)?;
         Self::rational_arg_to_f64(val)
-    }
-
-    // 找 sensitivity 属性
-    fn find_sensitivity_attr(forward: &FnDef) -> Option<&Attribute> {
-        forward.attributes.iter().find(|a| a.name == SENSITIVITY_ATTR)
-    }
-
-    // 从属性里找 const 键对应的值
-    fn find_const_value_in_attr(attr: &Attribute) -> Option<&AttributeArg> {
-        for arg in &attr.args {
-            if let AttributeArg::KeyValue(key, val) = arg {
-                if key == CONST_KEY {
-                    return Some(val);
-                }
-            }
-        }
-        None
-    }
-
-    // 关键修复：原来这个 helper 叫 parse_rational，跟 rational.rs 里已有
-    // 的 `TypeChecker::parse_rational(s: &str) -> Option<(i128, u128)>`
-    // 撞名——Rust 不支持重载，同一个类型上两个同名关联方法直接编译不过
-    // （E0592）。改名成 rational_arg_to_f64，顺便把 const_sensitivity
-    // 那边调用的 `parse_rational_to_f64`（这个名字全文件都没定义过，
-    // 明显是改名改了一半、调用点没跟上，E0599）一并对齐成这个真实存在
-    // 的名字。内部该调用的还是 rational.rs 那个真正做字符串解析的
-    // `Self::parse_rational`，不是自己再写一遍。
-    fn rational_arg_to_f64(arg: &AttributeArg) -> Option<f64> {
-        if let AttributeArg::Rational(r) = arg {
-            Self::parse_rational(r).map(|(num, den)| num as f64 / den as f64)
-        } else {
-            None
-        }
     }
 
     // ===== 检查 =====

@@ -1,16 +1,17 @@
 // src/semantic/module.rs
-mod check_program;
-mod check_func;
-mod check_stmt;
+mod check_attr;
 mod check_block;
 mod check_expr;
-mod check_type;
+mod check_func;
 mod check_generic;
 mod check_model;
+mod check_pattern;
+mod check_program;
+mod check_stmt;
+mod check_type;
 mod helpers;
 mod hunt;
 mod lookup;
-mod pattern;
 mod privacy;
 mod rational;
 

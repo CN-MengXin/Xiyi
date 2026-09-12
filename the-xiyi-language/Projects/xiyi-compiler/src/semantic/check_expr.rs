@@ -1190,7 +1190,7 @@ impl TypeChecker {
             ExprKind::EnumVariantConstruction { enum_name, variant_name, args } => {
                 self.check_enum_variant_construction(enum_name, variant_name, args, None)
             }
-            // ---- Match：模式检查挪到了 pattern.rs 的 check_match_expr 里，
+            // ---- Match：模式检查挪到了 check_pattern.rs 的 check_match_expr 里，
             // 这里只是委托调用。
             ExprKind::Match(match_expr) => self.check_match_expr(match_expr),
             // 关键修复：之前这里完全无视 unsafe 块里到底写了什么，无条件
