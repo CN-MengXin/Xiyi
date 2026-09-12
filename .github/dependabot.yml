@@ -5,19 +5,33 @@
 
 version: 2
 updates:
-  # Rust Cargo 依赖配置
+  # ========== Rust Cargo 依赖 ==========
   - package-ecosystem: "cargo"
     # 【关键】指向你 Cargo.toml 所在的实际目录
     directory: "/the-xiyi-language/Projects/xiyi-compiler"
     schedule:
       # 【推荐】将检查频率从每周改为每天，以便更快发现更新
       interval: "daily"
-    # 允许同时打开的 PR 数量，默认是 5，适当提高可加快更新
-    open-pull-requests-limit: 10
+      # 【三】改为世界协调时（UTC）凌晨 0 点检查
+      time: "00:00"
+      timezone: "UTC"
+    # 允许同时打开的 PR 数量，默认是 5，这里提到 15
+    open-pull-requests-limit: 15
     # 为 PR 添加标签，方便识别和管理
     labels:
       - "dependencies"
       - "rust"
+    # 【二】让 commit 历史里一眼看出是 Dependabot 提的
+    # 提交信息形如：Chore(deps): bump logos from 0.14.4 to 0.16.1
+    commit-message:
+      prefix: "Chore(deps)"
+      prefix-development: "Chore(dev-deps)"
+      include: "scope"
+    # 【六】显式指定 versioning-strategy。
+    # 对编译器这类应用，“increase” 是合理选择：
+    # 允许把依赖的版本要求往上抬，Dependabot 会按新版本改 Cargo.toml。
+    # 若以后项目性质变成库，可考虑 "increase-if-necessary" 或 "widen"。
+    versioning-strategy: "increase"
     # 【彻底】将相关更新分组，减少 PR 数量，方便批量审查
     groups:
       # 将所有补丁级别的更新归为一组
@@ -32,5 +46,43 @@ updates:
           - "*"
         update-types:
           - "minor"
+      # 【四】major 单独成组，但不自动合并。
+      # 分组只是把同一次检查里的多个 major 更新塞进同一个 PR，
+      # 减少 PR 数量；是否合并仍然由你人工决定。
+      cargo-major:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
     # 默认的 rebase 策略即可，Dependabot 会在有冲突时尝试自动变基
     rebase-strategy: "auto"
+    # 【五】自动分配和请求审查，方便跟踪
+    assignees:
+      - "LouhPaang"
+    reviewers:
+      - "LouhPaang"
+
+  # ========== GitHub Actions 自身 ==========
+  # 【一】你 workflow 里用了一堆 action：
+  #   actions/checkout@v4
+  #   dtolnay/rust-toolchain@stable
+  #   Swatinem/rust-cache@v2
+  #   EmbarkStudios/cargo-deny-action@v2
+  # 这些 action 本身也会过时。让 Dependabot 也帮你盯它们。
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      # 同样改为 UTC 凌晨 0 点
+      time: "00:00"
+      timezone: "UTC"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "Chore(ci)"
+      include: "scope"
+    assignees:
+      - "LouhPaang"
+    reviewers:
+      - "LouhPaang"
