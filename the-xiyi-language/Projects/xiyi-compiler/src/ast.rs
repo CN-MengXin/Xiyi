@@ -534,6 +534,20 @@ impl Type {
             _ => None,
         }
     }
+
+    // 关键新增：`match ty { Type::Never => true, _ => false }` 这个三行
+    // 模式在 mir_builder.rs 里出现了 5 次（If 的 then/else 分支、Match
+    // 的两处 arm 循环、内建调用的发散性校验），项目里不用宏，唯一能
+    // 压缩这种重复的办法就是挪成 Type 自己的方法——跟 privacy_tag 是
+    // 同一个道理："这个类型是不是 Never"本来就是 Type 的属性。以后
+    // Never 的语义如果扩展（比如引入 Privacy(Never) 需要一并算作
+    // "发散"），只用改这一处，不用满项目找有几处手写的 match。
+    pub fn is_never(&self) -> bool {
+        match self {
+            Type::Never => true,
+            _ => false,
+        }
+    }
 }
 
 // ===== 隐私标签 =====

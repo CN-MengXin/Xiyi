@@ -58,10 +58,46 @@ pub struct MirBuilder {
     // 又是无条件对作用域里的每个变量插 Drop——回到了"对已经被移动走
     // （哪怕只是部分移动）的值重复调用 drop()，生成的 Rust 编译不过"
     // 这个问题。理由和之前完全一样，不重复展开，直接照抄那一轮的实现。
+    //
+    // 已知限制（不是这次要修的范围，如实记录）：这是个"变量级"的二值
+    // 集合，只能表达"整个变量被移走了 / 没被移走"，没有字段级精度。
+    // `let x = p.x;` 之后，真实 Rust 语义下 p 只是部分移动——p 离开
+    // 作用域时，rustc 会自动 partial-drop 剩下没被移走的字段，不需要
+    // 任何显式代码。但这里的处理是"只要 p 的任意一部分被移动过，就
+    // 把整个 p 登记进 moved、pop_scope 直接跳过它，不再显式 Drop"——
+    // 这保证了不会生成"对部分移动的值调用 drop()"这种编译不过的代码
+    // （这是硬错误，必须优先避免），代价是放弃了对 p 剩余字段做主动
+    // 显式 Drop 这件事，指望生成的 Rust 代码本身的作用域退出来兜底。
+    // 跟 borrow.rs 开头"部分移动暂按不改变初始化状态处理"是同一个
+    // 已经写明的简化，不是这次新引入的缺口——一旦真要做字段级精度，
+    // 这个字段要么升级成按 (base_id, 字段路径) 记录的结构，要么彻底
+    // 换一种不依赖显式 Drop 语句的设计。
     pub(crate) moved: std::collections::HashSet<SsaLocal>,
 }
 
 impl MirBuilder {
+    // 关键新增：build_fn 原来是直接手写一个 MirBuilder { ... } 结构体
+    // 字面量，把全部字段的初始值都摊开列一遍——字段一多就容易漏（新加
+    // 一个字段，忘了在这唯一的构造点补初始值，编译器会因为缺字段报错
+    // 提醒；但如果是把某个字段的"该有的初始值"改错了，比如新加一个
+    // `loop_stack: Vec<usize>` 忘了写成 `Vec::new()`，这种编译器不会
+    // 帮你查）。收口成一个构造器，以后要加新的构建期状态字段（比如
+    // 处理 break/continue 需要的 loop_stack、break_target），只用改
+    // 这一个地方，不用担心散落在别处的构造点漏改。
+    fn new(in_forward: bool) -> Self {
+        Self {
+            locals: Vec::new(),
+            blocks: Vec::new(),
+            current_block: 0,
+            scope: vec![HashMap::new()],
+            scope_vars: vec![Vec::new()],
+            unsafe_depth: 0,
+            in_forward,
+            ssa_versions: HashMap::new(),
+            moved: std::collections::HashSet::new(),
+        }
+    }
+
     pub fn build(hir: &HirProgram) -> Result<MirProgram, String> {
         let struct_fields: HashMap<String, HashMap<String, Type>> = hir
             .structs
@@ -180,17 +216,7 @@ impl MirBuilder {
     }
 
     fn build_fn(f: &HirFn, shared: &SharedContext) -> Result<MirFn, String> {
-        let mut builder = MirBuilder {
-            locals: Vec::new(),
-            blocks: Vec::new(),
-            current_block: 0,
-            scope: vec![HashMap::new()],
-            scope_vars: vec![Vec::new()],
-            unsafe_depth: 0,
-            in_forward: f.is_forward,
-            ssa_versions: HashMap::new(), 
-            moved: std::collections::HashSet::new(),
-        };
+        let mut builder = MirBuilder::new(f.is_forward);
         builder.new_block(); // 入口块，id = 0（struct 里 current_block 已经是 0，不用再赋一次）
 
         for param in &f.params {
@@ -422,15 +448,16 @@ impl MirBuilder {
         if let HirExprKind::Literal(lit) = &expr.kind {
             return Ok(MirOperand::Constant(lit.clone()));
         }
-        if let HirExprKind::Ident(name) = &expr.kind {
-            let id = self.lookup(name).ok_or_else(|| format!("undefined variable `{}`", name))?;
-            let ssa = self.current_ssa(id);
-            // 关键修复（找回上一轮的修复）：读取一个已有变量统一走
-            // Move，就要记下来——见 MirBuilder.moved 字段和 pop_scope
-            // 的说明，后面给作用域补 Drop 的时候要跳过它。
-            self.moved.insert(ssa);
-            return Ok(MirOperand::Move(MirPlace::Ssa(ssa)));
-        }
+        // 关键修复：这里原来还有一段跟 build_expr_rvalue 的
+        // HirExprKind::Ident 分支一模一样的代码（查作用域、算 SSA、插
+        // moved、包成 Move 返回）。两份不会同时执行（这里直接 return），
+        // 但逻辑重复——以后 Ident 的语义要是从 Move 改成 Copy，容易
+        // 只改一处漏掉另一处。删掉这个特判，让 Ident 落进下面的通用
+        // 路径：build_expr_rvalue 对 Ident 本来就返回
+        // `MirRvalue::Use(Move(...))`，下面 `if let MirRvalue::Use(operand)
+        // = rvalue { return Ok(operand); }` 会原样把这个 operand 展开
+        // 返回——跟删之前的特判行为完全一致，只是现在只有一个地方
+        // 写着"Ident 该怎么处理"。
         let rvalue = self.build_expr_rvalue(expr, shared)?;
         // 已经是 Use(operand) 的情况，直接展开，不用画蛇添足再包一层
         // 临时变量。
@@ -481,6 +508,16 @@ impl MirBuilder {
             }
             HirExprKind::FieldAccess { .. } | HirExprKind::Index { .. } => {
                 let place = self.build_place(expr, shared)?;
+                // 关键修复：读一个字段/下标也是对底层变量的一次移动
+                // （部分移动），跟裸 Ident 读取一样得登记进 moved——不然
+                // pop_scope 会在这个变量离开作用域时照常插一条 Drop，
+                // 对一个已经被部分移动过的值调用 drop()，生成的 Rust
+                // 编译不过。这是"变量级"的登记（见 MirBuilder.moved
+                // 字段上的说明），不是真正的字段级精度，但保证了不生成
+                // 编译不过的代码，这是眼下要修的问题。
+                if let Some(base) = Self::place_base_ssa(&place) {
+                    self.moved.insert(base);
+                }
                 Ok(MirRvalue::Use(MirOperand::Move(place)))
             }
             HirExprKind::Call { qualifier, func, generic_args, args, is_method } => {
@@ -552,10 +589,7 @@ impl MirBuilder {
                 }
 
                 // 4) 真正的内建/固有函数：查 intrinsic.rs 的注册表。
-                let expr_diverges = match expr.ty {
-                    Type::Never => true,
-                    _ => false,
-                };
+                let expr_diverges = expr.ty.is_never();
                 let (is_intrinsic, intrinsic_name) = crate::intrinsic::resolve_intrinsic_call(
                     qualifier, func, *is_method, self.in_forward, self.unsafe_depth, expr_diverges,
                 )?;
@@ -651,10 +685,7 @@ impl MirBuilder {
 
                 // ---------- Then 分支 ----------
                 self.switch_to_block(then_block);
-                let then_diverges = match then_expr.ty {
-                    Type::Never => true,
-                    _ => false,
-                };
+                let then_diverges = then_expr.ty.is_never();
                 let then_operand = self.build_expr(then_expr, shared)?;
                 if then_diverges {
                     self.set_terminator(MirTerminator::Unreachable);
@@ -675,10 +706,7 @@ impl MirBuilder {
                 self.switch_to_block(else_block);
                 match else_expr {
                     Some(e) => {
-                        let else_diverges = match e.ty {
-                            Type::Never => true,
-                            _ => false,
-                        };
+                        let else_diverges = e.ty.is_never();
                         let else_operand = self.build_expr(e, shared)?;
                         if else_diverges {
                             self.set_terminator(MirTerminator::Unreachable);
@@ -1081,10 +1109,7 @@ impl MirBuilder {
                                 self.moved.insert(self.current_ssa(cond_temp));
                             }
 
-                            let arm_diverges = match arm_expr.ty {
-                                Type::Never => true,
-                                _ => false,
-                            };
+                            let arm_diverges = arm_expr.ty.is_never();
                             let operand = self.build_expr(arm_expr, shared)?;
                             if arm_diverges {
                                 self.set_terminator(MirTerminator::Unreachable);
@@ -1222,10 +1247,7 @@ impl MirBuilder {
 
                         for (block, arm_expr) in arm_infos {
                             self.switch_to_block(block);
-                            let arm_diverges = match arm_expr.ty {
-                                Type::Never => true,
-                                _ => false,
-                            };
+                            let arm_diverges = arm_expr.ty.is_never();
                             let operand = self.build_expr(arm_expr, shared)?;
                             if arm_diverges {
                                 self.set_terminator(MirTerminator::Unreachable);

@@ -66,6 +66,27 @@ impl MirBuilder {
         SsaLocal { base_id, version }
     }
 
+    // 关键修复：FieldAccess/Index 读一个字段/下标（`let x = p.x;`/
+    // `let x = arr[i];`）之前完全没往 moved 里登记任何东西——build_place
+    // 递归拆出来的最终 MirPlace 是 Field{base:...}/Index{base:...}，
+    // 只存了"读的是哪个字段/下标"，从没往上找过"这次操作到底 touch 的
+    // 是哪个变量"，导致 pop_scope 在 p 离开作用域时照常给它插一条
+    // Drop——对一个已经被（哪怕只是部分）移动过的值调用 drop()，生成
+    // 的 Rust 编译不过。这个 helper 就是补上"往上找到底"这一步：Field/
+    // Index/Deref/EnumPayload 都是"在某个 place 上面套一层投影"，顺着
+    // base 一路往下找，找到 Ssa 就是这次操作真正touch 到的那个变量；
+    // Static 没有对应的局部变量，返回 None。
+    pub(crate) fn place_base_ssa(place: &MirPlace) -> Option<SsaLocal> {
+        match place {
+            MirPlace::Ssa(s) => Some(*s),
+            MirPlace::Field { base, .. } => Self::place_base_ssa(base),
+            MirPlace::Index { base, .. } => Self::place_base_ssa(base),
+            MirPlace::Deref(base) => Self::place_base_ssa(base),
+            MirPlace::EnumPayload { base, .. } => Self::place_base_ssa(base),
+            MirPlace::Static(_) => None,
+        }
+    }
+
     // 关键新增：Pattern::IntLiteral 只存了一个裸 i64（这是 ast.rs 里
     // Pattern 自己的限制，还没跟着这一轮 Literal 拆分成按位宽/符号
     // 区分的一堆变体一起升级——也就是说目前没法用字面量模式匹配超出
