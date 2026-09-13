@@ -1,0 +1,9 @@
+fn main() -> i32 {
+    var my_sum: i32 = 0;
+    var idx: i32 = 0;
+    while idx < 10 {
+        my_sum = my_sum + idx;
+        idx = idx + 1;
+    }
+    my_sum
+}

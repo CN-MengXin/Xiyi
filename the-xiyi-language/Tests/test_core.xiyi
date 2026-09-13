@@ -1,0 +1,14 @@
+fn test_rational() -> i32 { 0 }
+fn test_symint() -> i32 { 0 }
+fn test_privacy_lattice() -> i32 { 0 }
+
+fn main() -> i32 {
+    var result: i32 = 0;
+    result = test_rational();
+    lack if result != 0 { return result; }
+    result = test_symint();
+    lack if result != 0 { return result; }
+    result = test_privacy_lattice();
+    lack if result != 0 { return result; }
+    0
+}

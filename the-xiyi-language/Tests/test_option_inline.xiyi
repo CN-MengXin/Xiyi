@@ -1,0 +1,8 @@
+fn main() -> i32 {
+    let x = Some(42);
+    if x.is_some() && !x.is_none() && x.unwrap() == 42 {
+        0
+    } else {
+        1
+    }
+}

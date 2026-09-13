@@ -1,0 +1,8 @@
+struct Box<T> {
+    value: T,
+}
+
+fn main() -> i32 {
+    let _ = Box { value: 42 };
+    0
+}

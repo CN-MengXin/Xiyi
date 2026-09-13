@@ -1,0 +1,8 @@
+fn id<T>(x: T) -> T {
+    x
+}
+
+fn main() -> i32 {
+    let _ = id(42);
+    0
+}

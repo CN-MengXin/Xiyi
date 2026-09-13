@@ -1,0 +1,7 @@
+fn main() -> i32 {
+    var my_sum: i32 = 0;
+    for i in 0..10 {
+        my_sum = my_sum + i;
+    }
+    my_sum
+}

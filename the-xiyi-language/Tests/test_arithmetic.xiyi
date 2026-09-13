@@ -1,0 +1,10 @@
+fn main() -> i32 {
+    let a: i32 = 10;
+    let b: i32 = 20;
+    let c: i32 = a + b;
+    if c == 30 {
+        0
+    } else {
+        1
+    }
+}
