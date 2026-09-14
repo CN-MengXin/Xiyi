@@ -1,22 +1,23 @@
 pub mod token;
 pub mod lexer;
 pub mod ast;
-pub mod parser;
+#[path = "syntactic/module.rs"]
+pub mod syntactic;
 pub mod intrinsic;
-pub mod hir;
-pub mod hir_builder;
 #[path = "semantic/module.rs"]
 pub mod semantic;
-pub mod elaborate;
+pub mod calc;
+pub mod hir;
+pub mod hir_builder;
 pub mod mir;
 pub mod mir_builder;
 pub mod state;
 pub mod guide;
-pub mod calc;
 pub mod control;
 pub mod borrow;
 pub mod monomorphic;
 pub mod simplify;
+pub mod elaborate;
 pub mod codegen;
 
 pub use ast::*;
@@ -24,7 +25,7 @@ pub use ast::*;
 #[cfg(test)]
 mod tests {
     use crate::lexer::Lexer;
-    use crate::parser::Parser;
+    use crate::syntactic::Parser;
     use crate::semantic::TypeChecker;
 
     #[test]

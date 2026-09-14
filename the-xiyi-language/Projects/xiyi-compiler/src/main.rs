@@ -5,7 +5,7 @@ use std::process::Command;
 
 use xiyi_compiler::{
     ast::Item,
-    parser::Parser,
+    syntactic::Parser,
     semantic::TypeChecker,
     borrow, control, monomorphic,
 };
