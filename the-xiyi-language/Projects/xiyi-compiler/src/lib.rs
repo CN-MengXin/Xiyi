@@ -1,23 +1,40 @@
+// ===== 引擎 =====
+#[path = "engine/module.rs"]
+pub mod engine;
+
+// ===== 词法 =====
 pub mod token;
 pub mod lexer;
+
+// ===== 语法 =====
 pub mod ast;
 #[path = "syntactic/module.rs"]
 pub mod syntactic;
-pub mod intrinsic;
+
+// ===== 语义 =====
 #[path = "semantic/module.rs"]
 pub mod semantic;
-pub mod calc;
+
+// ===== HIR =====
 pub mod hir;
 pub mod hir_builder;
+pub mod elaborate;
+
+// ===== MIR =====
+pub mod intrinsic;
 pub mod mir;
 pub mod mir_builder;
 pub mod state;
 pub mod guide;
+
+// ===== 简化与检查 =====
 pub mod control;
 pub mod borrow;
 pub mod monomorphic;
 pub mod simplify;
-pub mod elaborate;
+pub mod calc;
+
+// ===== 生成 =====
 pub mod codegen;
 
 pub use ast::*;
