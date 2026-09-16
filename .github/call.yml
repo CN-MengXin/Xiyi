@@ -1,0 +1,19 @@
+Compiler:
+  - changed-files:
+      - any-glob-to-any-file: the-xiyi-language/Projects/xiyi-compiler/**
+
+Standard:
+  - changed-files:
+      - any-glob-to-any-file: the-xiyi-language/Standard/**
+
+Docs:
+  - changed-files:
+      - any-glob-to-any-file: "**/*.md"
+
+Tests:
+  - changed-files:
+      - any-glob-to-any-file: the-xiyi-language/Tests/**
+
+Robots:
+  - changed-files:
+      - any-glob-to-any-file: .github/workflows/**
