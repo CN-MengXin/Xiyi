@@ -43,6 +43,25 @@ pub(crate) struct SharedContext {
     pub(crate) variant_payload_types: HashMap<(String, String), Type>,
 }
 
+// 关键新增：break 要跳到哪个 end_block，取决于"离它最近的那层 while/
+// loop"，天然是一个栈——嵌套循环时，内层 break 只影响内层，不能捅穿
+// 到外层循环的 end_block，进入内层循环时 push 一层，构建完内层循环体
+// 后 pop 掉，栈顶永远是"当前离 break 语句最近的那层循环"该跳去的地方。
+//
+// scope_depth 记的是"进入这层循环体之前，self.scope_vars 已经有多少层"
+// （即循环体自己的 push_scope 还没发生时的深度）。break 语句执行时，
+// 当前可能已经在循环体内部又嵌套了若干层 block/match 分支的作用域
+// （build_block/HirExprKind::Block 每进一层都会 push_scope），这些
+// "循环体内部"的作用域到 break 发生时全部要被跳过、里面活着的变量全部
+// 要在跳走之前补 Drop——但循环体之外（scope_depth 那一层以下）的作用域
+// 不受 break 影响，仍然活着，不能碰。用这个深度值就能精确切出
+// "该 Drop 哪一段 scope_vars"，不多不少。
+#[derive(Clone, Copy)]
+pub(crate) struct LoopCtx {
+    pub(crate) break_target: usize,
+    pub(crate) scope_depth: usize,
+}
+
 pub struct MirBuilder {
     pub(crate) locals: Vec<MirLocal>,
     pub(crate) blocks: Vec<MirBlock>,
@@ -73,6 +92,11 @@ pub struct MirBuilder {
     // 这个字段要么升级成按 (base_id, 字段路径) 记录的结构，要么彻底
     // 换一种不依赖显式 Drop 语句的设计。
     pub(crate) moved: std::collections::HashSet<SsaLocal>,
+    // 关键新增：接上 elaborate.rs 那条链路——elaborate 已经把 for 展开
+    // 成 `loop { match __iter.next() { Some(v) => body, None => break } }`，
+    // MIR 构建这边必须知道 break 该跳去哪，不然这条链路就是断的（HIR
+    // 里带着 Break 节点，MIR 侧却处理不了）。见上面 LoopCtx 的注释。
+    pub(crate) loop_stack: Vec<LoopCtx>,
 }
 
 impl MirBuilder {
@@ -95,6 +119,7 @@ impl MirBuilder {
             in_forward,
             ssa_versions: HashMap::new(),
             moved: std::collections::HashSet::new(),
+            loop_stack: Vec::new(),
         }
     }
 
@@ -387,7 +412,15 @@ impl MirBuilder {
                 });
 
                 self.switch_to_block(body_block);
-                self.build_block(body, shared)?;
+                // 关键新增：接上循环栈——body 内部（可能嵌套若干层
+                // block/match）出现的 Break 要能找到这里的 end_block。
+                // push_loop 记的 scope_depth 是"body 自己的 push_scope
+                // 还没发生"时的深度，build_block 马上会 push 一层，跟
+                // Break 分支里"该 Drop 到哪一层为止"的计算对得上。
+                self.push_loop(end_block);
+                let body_result = self.build_block(body, shared);
+                self.pop_loop();
+                body_result?;
                 if self.current_terminator_is_placeholder() {
                     self.set_terminator(MirTerminator::Goto(cond_block));
                 }
@@ -401,7 +434,11 @@ impl MirBuilder {
 
                 self.set_terminator(MirTerminator::Goto(body_block));
                 self.switch_to_block(body_block);
-                self.build_block(body, shared)?;
+                // 同 While 分支：进 body 之前 push，出来之后 pop。
+                self.push_loop(end_block);
+                let body_result = self.build_block(body, shared);
+                self.pop_loop();
+                body_result?;
                 if self.current_terminator_is_placeholder() {
                     self.set_terminator(MirTerminator::Goto(body_block));
                 }
@@ -410,20 +447,58 @@ impl MirBuilder {
                 Ok(None)
             }
             HirStmt::Break { .. } => {
-                // TODO: 需要一个循环栈（跟 While/Loop 配合）才能知道
-                // "break 该跳到哪个 end_block"。这一版先把 While/Loop 的
-                // 主干打通，循环栈跟 Break/Continue 一起放下一轮——
-                // Continue 目前语言里也还没有对应的语句节点（ast.rs/
-                // hir.rs 都没有 Continue 变体，parser.rs 也没接语法），
-                // 两个一起处理更合适。
-                Err("MIR lowering for Break: 循环栈还没接上，下一轮跟 Continue 一起做".to_string())
+                // 关键修复：接上 elaborate.rs 那条链路——for 循环被展开成
+                // `loop { match __iter.next() { Some(v) => body, None => break } }`
+                // （§expand_for/build_for_next_match），HIR 里这条 Break
+                // 早就在了，缺的只是 MIR 这边怎么用循环栈找到该跳去哪。
+                // loop_stack 为空说明 break 出现在任何 while/loop 之外，
+                // sema.rs 应该已经拦住这种情况，这里报错而不是 panic，
+                // 方便定位是不是两边检查不一致。
+                let loop_ctx = self.loop_stack.last().copied().ok_or_else(|| {
+                    "internal error: HirStmt::Break 出现在循环之外 \
+                     (sema.rs 的检查应该已经拦住这种情况，走到这里说明两边检查不一致)"
+                        .to_string()
+                })?;
+
+                // 跟 Return 分支同样的借用检查考量（E0502）：先只读地把
+                // 要 Drop 的 SsaLocal 收集进独立 Vec，收集范围只到
+                // loop_ctx.scope_depth 为止——那是循环体自己的作用域，
+                // 再往外是循环外层还活着的作用域，break 不影响它们，不能
+                // 一起 Drop 掉（这跟 Return 一次性 Drop 所有作用域的语义
+                // 不一样：Return 退出的是整个函数，Break 只退出这一层
+                // 循环）。收集完这一轮不可变借用结束，再单独一轮调用
+                // push_stmt。
+                let mut to_drop = Vec::new();
+                for scope_ids in self.scope_vars[loop_ctx.scope_depth..].iter().rev() {
+                    for &id in scope_ids.iter().rev() {
+                        let ssa = self.current_ssa(id);
+                        if !self.moved.contains(&ssa) {
+                            to_drop.push(ssa);
+                        }
+                    }
+                }
+                for ssa in to_drop {
+                    self.push_stmt(MirStmt::Drop { place: MirPlace::Ssa(ssa) });
+                }
+
+                self.set_terminator(MirTerminator::Goto(loop_ctx.break_target));
+                // 跟 Return 分支一样：break 之后同一个源 block 里如果还有
+                // 语句（死代码），需要一个新块承接，不能继续塞进已经
+                // 终止的当前块。
+                let next = self.new_block();
+                self.switch_to_block(next);
+                Ok(None)
             }
             HirStmt::For { .. } => {
-                // for 循环的降维依赖 Iterator 协议，按流水线设计应该由
-                // elaborate.rs 在进入 MIR 构建之前展开成 while + 协议调用。
-                // elaborate.rs 目前是空壳，这里先给出清晰的报错而不是
-                // panic，方便定位。
-                Err("HirStmt::For 不该走到 mir_builder 这一层——应由 elaborate.rs 先展开成 while，但 elaborate.rs 目前还是空实现".to_string())
+                // 这一支现在纯粹是防御性检查：按流水线设计
+                // （pipeline.rs：Elaborate::elaborate 在 MirBuilder::build
+                // 之前跑），HirStmt::For 应该已经被 elaborate.rs 的
+                // expand_for 展开成 `let __iter = ...; loop { match
+                // __iter.next() { ... } }`，不会有 For 节点活着走到这一层。
+                // 真走到这里，说明要么漏调了 elaborate 那一趟，要么有
+                // 别的路径绕过了它——报错而不是 panic，方便定位是流水线
+                // 顺序问题还是 elaborate.rs 本身漏了某种 For 场景。
+                Err("internal error: HirStmt::For 不该走到 mir_builder 这一层——elaborate.rs 应已在 MIR 构建之前将其展开成 loop + match".to_string())
             }
             HirStmt::UnsafeBlock { body, .. } => {
                 self.unsafe_depth += 1;

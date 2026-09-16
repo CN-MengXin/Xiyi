@@ -18,7 +18,7 @@ use crate::ast::Type;
 // ast.rs 导入，不依赖某个中间模块顺手公开转发了它这件事。
 use crate::ast::Literal;
 use crate::mir::*;
-use crate::mir_builder::MirBuilder;
+use crate::mir_builder::{LoopCtx, MirBuilder};
 use std::collections::HashMap;
 
 impl MirBuilder {
@@ -139,6 +139,27 @@ impl MirBuilder {
             }
         }
         self.scope.pop();
+    }
+
+    // -------- 循环栈（给 break 用） --------
+    // 关键新增：跟 push_scope/pop_scope 配套，在进入 While/Loop 的循环
+    // 体之前调用——此时循环体自己的 push_scope 还没发生，记下的
+    // scope_depth 就是"循环体之外"的作用域层数，break 时用它切出
+    // "循环体内部、该被跳过并补 Drop"的那一段 scope_vars（见 LoopCtx
+    // 定义处的注释）。
+    pub(crate) fn push_loop(&mut self, break_target: usize) {
+        self.loop_stack.push(LoopCtx {
+            break_target,
+            scope_depth: self.scope_vars.len(),
+        });
+    }
+
+    // 循环体构建完毕（不管成功还是中途报错）都要弹栈，避免栈里留着
+    // 一层已经不存在的循环，把外层同名/同层级的另一个循环的 break
+    // 误导到这层失效的目标上。调用点用"先 pop 再 `?` 传播错误"的顺序
+    // 保证这一点，见 mir_builder.rs 里 While/Loop 分支的写法。
+    pub(crate) fn pop_loop(&mut self) {
+        self.loop_stack.pop();
     }
 
     pub(crate) fn bind(&mut self, name: String, id: usize) {

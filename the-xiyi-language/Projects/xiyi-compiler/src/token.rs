@@ -215,6 +215,8 @@ pub enum Token {
     And,
     #[token("||")]
     Or,
+    #[token("|>")]
+    PipeOp,
     #[token("!")]
     Bang,
     #[token("|")]
