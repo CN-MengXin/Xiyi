@@ -375,9 +375,18 @@ impl<'a> Lexer<'a> {
                         }
                     }
                     '|' => {
-                        if let Some((_, '=')) = iter.peek() {
-                            iter.next();
-                            Token::Or
+                        if let Some((_, ch)) = iter.peek() {
+                            match ch {
+                                '|' => {
+                                    iter.next();
+                                    Token::Or
+                                }
+                                '>' => {
+                                    iter.next();
+                                    Token::PipeOp
+                                }
+                                _ => Token::Pipe,
+                            }
                         } else {
                             Token::Pipe
                         }
