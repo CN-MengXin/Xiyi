@@ -141,6 +141,46 @@ impl MirBuilder {
         self.scope.pop();
     }
 
+    // -------- 提前退出前的批量 Drop（给 Return / Break 用） --------
+    // 关键重构：Return 和 Break 原来各自手写一遍几乎一模一样的"收集要
+    // Drop 的 SsaLocal，再统一 push_stmt"逻辑（写成两遍分别是为了绕开
+    // 同一个 E0502 借用检查问题——一边不可变遍历 scope_vars，一边要
+    // push_stmt 需要 &mut self），唯一的区别是遍历 scope_vars 的起始
+    // 深度：Return 退出的是整个函数，从 0（最外层）开始；Break 只退出
+    // 这一层循环，从 loop_ctx.scope_depth（循环体自己的作用域）开始。
+    // 抽成一个方法，调用点只需要传一个"从哪层开始"的深度。
+    //
+    // 关键修复（这一轮补上的教训）：原来 Return/Break 各自的版本只
+    // push_stmt 了 Drop 语句，没有把这些变量登记进 self.moved——如果这条
+    // Return/Break 所在的块后面紧跟着一个 pop_scope（比如 Break 所在的
+    // while/loop 循环体自己 push_scope 对应的 pop_scope），pop_scope 会
+    // 对同一批变量再插一次 Drop，生成 `drop(x); drop(x);` 这种重复 Drop。
+    // 在目前的流水线顺序下（pipeline.rs：lower → control::simplify →
+    // borrow_check）这不会真的编译不过——Break 之后那个块从来没人
+    // Goto 进来，是死块，simplify 的 remove_dead_blocks 会在 borrow_check
+    // 看到它之前就把它删掉，最终 MIR 里只剩一份 Drop——但这份正确性是
+    // "死块恰好会被删掉"这个隐式前提撑起来的，不是这段代码自己就对。
+    // 老老实实把已经 Drop 过的变量也登记进 moved，让正确性不用依赖
+    // 别的 pass 的执行顺序。
+    pub(crate) fn emit_drops_for_scopes(&mut self, from_depth: usize) {
+        // 跟 pop_scope 同样的借用检查考量（E0502）：先只读地把要 Drop
+        // 的 SsaLocal 收集进独立 Vec（只碰 scope_vars/moved，用的都是
+        // &self），这一轮不可变借用结束后，再单独一轮调用 push_stmt。
+        let mut to_drop = Vec::new();
+        for scope_ids in self.scope_vars[from_depth..].iter().rev() {
+            for &id in scope_ids.iter().rev() {
+                let ssa = self.current_ssa(id);
+                if !self.moved.contains(&ssa) {
+                    to_drop.push(ssa);
+                }
+            }
+        }
+        for ssa in to_drop {
+            self.push_stmt(MirStmt::Drop { place: MirPlace::Ssa(ssa) });
+            self.moved.insert(ssa);
+        }
+    }
+
     // -------- 循环栈（给 break 用） --------
     // 关键新增：跟 push_scope/pop_scope 配套，在进入 While/Loop 的循环
     // 体之前调用——此时循环体自己的 push_scope 还没发生，记下的
