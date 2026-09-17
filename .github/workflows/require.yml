@@ -1,0 +1,38 @@
+name: "Require"
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.user.type != 'Bot'
+      && github.actor != 'dependabot[bot]'
+      && github.actor != 'dependabot-preview[bot]'
+    steps:
+      - name: Validate PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          expected="New version of The Xiyi Language"
+
+          # 1) It must contain ASCII characters only. (bytes in the range from 0x00 to 0x7F)
+          if printf '%s' "$TITLE" | LC_ALL=C grep -q '[^[:ascii:]]'; then
+            echo "::error::PR title must contain ASCII characters only (no Unicode)."
+            echo "Current title: \"$TITLE\""
+            exit 1
+          fi
+
+          # 2) It must be an exact match.
+          if [ "$TITLE" != "$expected" ]; then
+            echo "::error::The changing title must be: \"$expected\""
+            echo "However, the current wording is: \"$TITLE\""
+            exit 1
+          fi
+
+          echo "The existing title meets this requirement."

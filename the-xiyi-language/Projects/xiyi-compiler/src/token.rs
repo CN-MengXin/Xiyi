@@ -122,6 +122,7 @@ pub enum Token {
     Ge,
     And,
     Or,
+    PipeOp,
     Bang,
     Pipe,
     Amp,

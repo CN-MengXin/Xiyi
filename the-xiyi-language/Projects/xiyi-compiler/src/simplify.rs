@@ -31,7 +31,7 @@ impl Simplify {
         // 变量是 Copy 类型"，传给 fold_block/fold_stmt——复制传播
         // （copy_map）只有在来源是 Copy 类型时才能安全折叠。
         let copy_types: HashSet<usize> = f.body.locals.iter()
-            .filter(|l| Self::is_copy_type(&l.ty))
+            .filter(|l| l.ty.is_copy())
             .map(|l| l.id)
             .collect();
 
@@ -58,23 +58,15 @@ impl Simplify {
         }
     }
 
-    // 关键新增：跟 borrow.rs 里的 is_copy_type 是同一份逻辑（那边先
-    // 加过一次，这里补一份本地副本，原因见下面 fold_stmt 处的说明——
-    // 这两处独立判断"能不能安全地重复读一个值"这件事，标准必须完全
-    // 一致，理想情况下应该共享同一份实现而不是各写一份，但 borrow.rs
-    // 和 simplify.rs 目前没有一个共用的地方放这类小工具函数，两边各自
-    // 维护一份，如果以后要加新的 Copy 类型（比如给某些 struct 标注
-    // `#[derive(Copy)]` 之类的设计），要记得两边一起改。
-    fn is_copy_type(ty: &Type) -> bool {
-        match ty {
-            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
-            | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
-            | Type::F16 | Type::F32 | Type::F64
-            | Type::Bool | Type::Char | Type::Unit => true,
-            Type::Ref { mutable: false, .. } => true,
-            _ => false,
-        }
-    }
+    // 关键重构：这里原来有一份本地的 is_copy_type，跟 borrow.rs 里的
+    // 另一份各自维护——两边判断的是同一件事，标准必须完全一致，却分散
+    // 在两个文件里。这不是假设性的风险：borrow.rs 那份后来补上了
+    // Privacy/Tuple/Array 的递归处理（`(i32, i32)` 这种纯标量元组也该
+    // 算 Copy），这里那份完全没跟上，导致复制传播在这些类型上过度
+    // 保守，且没有任何编译错误提示两处已经不一致了。现在统一收进
+    // ast.rs::Type::is_copy()，这里预先用它算出 `copy_types` 这张表，
+    // 后面 fold_stmt 只需要查表（`copy_types.contains(...)`），不用在
+    // 每个语句上重新跑一遍类型判断。
 
     // ===== 块内折叠：常量传播 + 复制传播 =====
     // 关键设计：const_map / copy_map 都只按 SsaLocal 记事实，而且每个
@@ -500,34 +492,69 @@ impl Simplify {
     // ---- 辅助判断函数 ----
     // 关键修复：原来只认 `Literal::Int(0)`/`Literal::Int(1)`，这个变体
     // 已经不存在了；而且就算改名，也只够判断"一种"整数类型的 0/1——
-    // 现在整数按位宽/符号拆成了十个变体，随便一个字面量是 `Int8(0)`
+    // 现在整数按位宽/符号拆成了十二个变体，随便一个字面量是 `Int8(0)`
     // 还是 `UInt64(0)`，都得算作"是零"，不能只挑其中一个变体判断，
     // 不然大多数情况下这条优化直接就不生效了。
+    //
+    // 关键重构：项目里不用宏（包括 matches!，好几处都专门改回过显式
+    // match），is_zero/is_one 原来各写了一份 `matches!(op,
+    // MirOperand::Constant(Literal::IntN(0) | ... ))`——按位宽/符号列了
+    // 十二个变体，是零判断和是一判断这两份几乎一模一样，唯一的区别是
+    // 每个变体里包的数字是 0 还是 1。真正该抽出来复用的不是"判断是不是
+    // 零/一"本身，而是"不管来源是哪个整数字面量变体，把里面的数值统一
+    // 取出来"这一步——取出来之后，是零是一只是跟 0/1 比大小，不需要
+    // 再重复列一遍十二个变体。
+    fn int_literal_value(op: &MirOperand) -> Option<i128> {
+        match op {
+            MirOperand::Constant(lit) => match lit {
+                Literal::Int8(v) => Some(*v as i128),
+                Literal::Int16(v) => Some(*v as i128),
+                Literal::Int32(v) => Some(*v as i128),
+                Literal::Int64(v) => Some(*v as i128),
+                Literal::Int128(v) => Some(*v),
+                Literal::UInt8(v) => Some(*v as i128),
+                Literal::UInt16(v) => Some(*v as i128),
+                Literal::UInt32(v) => Some(*v as i128),
+                Literal::UInt64(v) => Some(*v as i128),
+                Literal::UInt128(v) => Some(*v as i128),
+                Literal::Isize(v) => Some(*v as i128),
+                Literal::Usize(v) => Some(*v as i128),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     fn is_zero(op: &MirOperand) -> bool {
-        matches!(
-            op,
-            MirOperand::Constant(
-                Literal::Int8(0) | Literal::Int16(0) | Literal::Int32(0) | Literal::Int64(0) | Literal::Int128(0)
-                | Literal::UInt8(0) | Literal::UInt16(0) | Literal::UInt32(0) | Literal::UInt64(0) | Literal::UInt128(0)
-                | Literal::Isize(0) | Literal::Usize(0)
-            )
-        )
+        match Self::int_literal_value(op) {
+            Some(v) => v == 0,
+            None => false,
+        }
     }
     fn is_one(op: &MirOperand) -> bool {
-        matches!(
-            op,
-            MirOperand::Constant(
-                Literal::Int8(1) | Literal::Int16(1) | Literal::Int32(1) | Literal::Int64(1) | Literal::Int128(1)
-                | Literal::UInt8(1) | Literal::UInt16(1) | Literal::UInt32(1) | Literal::UInt64(1) | Literal::UInt128(1)
-                | Literal::Isize(1) | Literal::Usize(1)
-            )
-        )
+        match Self::int_literal_value(op) {
+            Some(v) => v == 1,
+            None => false,
+        }
+    }
+    // 同样的道理：is_bool_true/is_bool_false 共用"取出 bool 字面量的值"
+    // 这一步。
+    fn bool_literal_value(op: &MirOperand) -> Option<bool> {
+        match op {
+            MirOperand::Constant(Literal::Bool(v)) => Some(*v),
+            _ => None,
+        }
     }
     fn is_bool_true(op: &MirOperand) -> bool {
-        matches!(op, MirOperand::Constant(Literal::Bool(true)))
+        match Self::bool_literal_value(op) {
+            Some(v) => v,
+            None => false,
+        }
     }
     fn is_bool_false(op: &MirOperand) -> bool {
-        matches!(op, MirOperand::Constant(Literal::Bool(false)))
+        match Self::bool_literal_value(op) {
+            Some(v) => !v,
+            None => false,
+        }
     }
 
     // ===== 空块消除（不涉及 Ssa/Local 的读写事实，跟 SSA 改造本身无关；
@@ -541,17 +568,22 @@ impl Simplify {
         let block_count = body.blocks.len();
         let mut replaced_targets = HashMap::new();
         for (block_id, block) in body.blocks.iter().enumerate() {
-            if block_id != 0 && block.stmts.is_empty() && matches!(&block.terminator, MirTerminator::Goto(_)) {
-                let target = if let MirTerminator::Goto(t) = &block.terminator {
-                    *t
-                } else {
-                    continue;
-                };
-                if target == block_id {
-                    continue;
-                }
-                replaced_targets.insert(block_id, target);
+            // 关键重构：原来先用 matches! 问一遍"终止器是不是 Goto"，
+            // 再紧接着用 if let 把里面的目标块 id 解出来——同一件事问了
+            // 两遍。项目里不用 matches! 宏，这里也没必要真的用它：直接
+            // 上 if let，配合 else 分支 continue 跳过不满足的情况，一步
+            // 到位。
+            if block_id == 0 || !block.stmts.is_empty() {
+                continue;
             }
+            let target = match &block.terminator {
+                MirTerminator::Goto(t) => *t,
+                _ => continue,
+            };
+            if target == block_id {
+                continue;
+            }
+            replaced_targets.insert(block_id, target);
         }
 
         if replaced_targets.is_empty() {
@@ -896,7 +928,10 @@ impl Simplify {
     // 猜（这样死赋值消除最多是少删几条本来能删的语句，不会删掉真正
     // 有副作用、不能删的调用）。
     fn has_side_effect(rv: &MirRvalue) -> bool {
-        matches!(rv, MirRvalue::Call { .. } | MirRvalue::MethodCall { .. })
+        match rv {
+            MirRvalue::Call { .. } | MirRvalue::MethodCall { .. } => true,
+            _ => false,
+        }
     }
 
     // ===== 死块消除 =====
@@ -1055,7 +1090,10 @@ impl Simplify {
         let is_unreachable_terminator: Vec<bool> = body
             .blocks
             .iter()
-            .map(|b| matches!(b.terminator, MirTerminator::Unreachable))
+            .map(|b| match b.terminator {
+                MirTerminator::Unreachable => true,
+                _ => false,
+            })
             .collect();
 
         for block in &mut body.blocks {

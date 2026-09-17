@@ -390,7 +390,7 @@ impl BorrowChecker {
         let moves = Self::moves_in_stmt(stmt);
         for base in moves {
             let ty = Self::get_var_type(f, base);
-            if !Self::is_copy_type(&ty) {
+            if !ty.is_copy() {
                 state.remove(&base);
             }
         }
@@ -874,26 +874,11 @@ impl BorrowChecker {
         }
     }
 
-    fn is_copy_type(ty: &Type) -> bool {
-        match ty {
-            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
-            | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
-            | Type::F16 | Type::F32 | Type::F64
-            | Type::Bool | Type::Char | Type::Unit => true,
-            Type::Ref { mutable: false, .. } => true,
-            Type::Privacy(inner, _) => Self::is_copy_type(inner),
-            // 关键修复：元组/定长数组要递归看每个元素是不是 Copy——
-            // `(i32, i32)` 这种纯标量元组，真实语义下跟裸标量一样是
-            // Copy，一律扔进最后的 `_ => false` 会把 `let t2 = t;` 误判
-            // 成一次真正的 move，t 之后被标成"未初始化"，对着完全合法
-            // 的程序报错。只要有一个元素不是 Copy，整体就不是 Copy，跟
-            // Rust 真实规则一致。
-            Type::Tuple(elems) => elems.iter().all(Self::is_copy_type),
-            Type::Array(elem, _) => Self::is_copy_type(elem),
-            // 注意：struct/enum 默认不是 Copy（除非用户显式标注，暂不实现）
-            _ => false,
-        }
-    }
+    // 关键重构：原来这里有一份 is_copy_type，跟 simplify.rs 里的另一份
+    // 各自维护、判断标准还悄悄不一致（simplify.rs 那边一直没跟上这里
+    // 后来补的 Privacy/Tuple/Array 递归处理）。现在统一收进
+    // ast.rs::Type::is_copy()，两边都改成调用 `ty.is_copy()`，不用再
+    // 记得"改 Copy 类型要两处一起改"这件事。
 
     fn get_var_type(f: &MirFn, base_id: usize) -> Type {
         f.body

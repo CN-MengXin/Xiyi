@@ -10,24 +10,40 @@
 use crate::ast::Type;
 use crate::hir::*;
 use crate::mir::*;
-use crate::mir_builder::{MirBuilder, SharedContext};
+use crate::mir_builder::{Diverging, MirBuilder, SharedContext};
 
 impl MirBuilder {
     // -------- Place（左值） --------
-    pub(crate) fn build_place(&mut self, expr: &HirExpr, shared: &SharedContext) -> Result<MirPlace, String> {
+    // 关键重构：build_place 现在也走跟 build_expr/build_expr_rvalue/
+    // build_block 同一套 Diverging<T> 传播——下标表达式本身可能发散
+    // （`arr[panic()] = 5;`），这里跟别处一样，见到 Diverged 就不再
+    // 往下求值，原样传播给调用方（目前唯一的调用方是 mir_builder.rs
+    // 的 HirStmt::Assign）。这个文件跟 mir_builder.rs 是平级模块，
+    // `propagate!` 宏没有额外导出为 pub(crate)，这里就不 `use` 它，
+    // 直接手写 match，跟宏展开出来的代码完全等价。
+    pub(crate) fn build_place(&mut self, expr: &HirExpr, shared: &SharedContext) -> Result<Diverging<MirPlace>, String> {
         match &expr.kind {
             HirExprKind::Ident(name) => {
                 let id = self.lookup(name).ok_or_else(|| format!("undefined variable `{}`", name))?;
-                Ok(MirPlace::Ssa(self.current_ssa(id)))
+                Ok(Diverging::Value(MirPlace::Ssa(self.current_ssa(id))))
             }
             HirExprKind::FieldAccess { struct_expr, field_name } => {
-                let base = self.build_place(struct_expr, shared)?;
-                Ok(MirPlace::Field { base: Box::new(base), field: field_name.clone() })
+                let base = match self.build_place(struct_expr, shared)? {
+                    Diverging::Diverged => return Ok(Diverging::Diverged),
+                    Diverging::Value(p) => p,
+                };
+                Ok(Diverging::Value(MirPlace::Field { base: Box::new(base), field: field_name.clone() }))
             }
             HirExprKind::Index { expr: base, index } => {
-                let base_place = self.build_place(base, shared)?;
-                let index_operand = self.build_expr(index, shared)?;
-                Ok(MirPlace::Index { base: Box::new(base_place), index: Box::new(index_operand) })
+                let base_place = match self.build_place(base, shared)? {
+                    Diverging::Diverged => return Ok(Diverging::Diverged),
+                    Diverging::Value(p) => p,
+                };
+                let index_operand = match self.build_expr(index, shared)? {
+                    Diverging::Diverged => return Ok(Diverging::Diverged),
+                    Diverging::Value(op) => op,
+                };
+                Ok(Diverging::Value(MirPlace::Index { base: Box::new(base_place), index: Box::new(index_operand) }))
             }
             _ => Err(format!(
                 "internal error: {:?} is not a valid assignment target \

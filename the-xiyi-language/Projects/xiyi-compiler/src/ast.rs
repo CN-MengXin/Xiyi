@@ -548,6 +548,37 @@ impl Type {
             _ => false,
         }
     }
+
+    // 关键重构：`is_copy_type` 原来在 borrow.rs（初始化检查的 move
+    // 判定）和 simplify.rs（复制传播能否折叠）里各写了一份——两边判断
+    // 的是同一件事："这个类型的值能不能被安全地重复读取，而不需要
+    // 当成一次 move"，标准必须完全一致，却分散在两个文件里维护。
+    // 这已经不是假设性的风险：这次核对就发现 borrow.rs 那份后来补上了
+    // Privacy/Tuple/Array 的递归处理（`(i32, i32)` 这种纯标量元组、
+    // `Tensor<f32, [3]><dp(1/1)>` 这种带隐私标签的类型，理应算 Copy），
+    // simplify.rs 那份完全没跟上，导致复制传播在这些类型上过度保守，
+    // 悄悄比 borrow.rs 的判断更严格，且没有任何编译错误提示这两处已经
+    // 不一致了。跟 is_never 是同一个道理，"这个类型是不是 Copy"本来就
+    // 是 Type 的属性，挪成 Type 自己的固有方法，以后加新的 Copy 类型
+    // （比如给某些 struct 标 `#[derive(Copy)]`）只用改这一处。
+    pub fn is_copy(&self) -> bool {
+        match self {
+            Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
+            | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
+            | Type::F16 | Type::F32 | Type::F64
+            | Type::Bool | Type::Char | Type::Unit
+            | Type::Never => true,
+            Type::Ref { mutable: false, .. } => true,
+            Type::Privacy(inner, _) => inner.is_copy(),
+            // 元组/定长数组要递归看每个元素是不是 Copy——只要有一个
+            // 元素不是 Copy，整体就不是 Copy，跟 Rust 真实规则一致。
+            Type::Tuple(elems) => elems.iter().all(|t| t.is_copy()),
+            Type::Array(elem, _) => elem.is_copy(),
+            // 注意：struct/enum 默认不是 Copy（除非用户显式标注，暂不
+            // 实现），SymInt/Str/Slice/可变引用等其余变体同样落进这里。
+            _ => false,
+        }
+    }
 }
 
 // ===== 隐私标签 =====
