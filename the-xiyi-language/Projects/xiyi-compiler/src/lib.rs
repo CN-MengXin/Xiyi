@@ -1,6 +1,8 @@
 pub mod token;
 pub mod lexer;
 pub mod ast;
+pub mod symbol_pool;
+pub mod unicode_ident;
 #[path = "syntactic/module.rs"]
 pub mod syntactic;
 pub mod intrinsic;
