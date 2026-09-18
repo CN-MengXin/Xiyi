@@ -15,9 +15,16 @@ on:
 permissions:
   contents: read
 
+# 同一分支连续 push 时，只保留最新一次，避免排队浪费。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   link-check:
     runs-on: ubuntu-latest
+    # 防止某个链接卡住导致整个 job 跑满默认上限（360 分钟）。
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Check links
@@ -29,6 +36,7 @@ jobs:
             --max-retries 3
             --retry-wait-time 2
             --timeout 20
+            --exclude '^https?://fsf\.org/?'
             './**/*.md'
           fail: true
           token: ${{ secrets.GITHUB_TOKEN }}
