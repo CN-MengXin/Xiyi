@@ -43,6 +43,7 @@ jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     defaults:
       run:
         working-directory: ${{ env.WORKDIR }}
@@ -56,6 +57,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: ${{ env.WORKDIR }}
@@ -72,6 +74,7 @@ jobs:
   test:
     name: Test
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +93,7 @@ jobs:
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # 【必须与 Cargo.toml 的 package.rust-version 保持同步】
     # Cargo.toml 里写的是 rust-version = "1.97"，
     # 这里就是 1.97.0。改 Cargo.toml 时务必同步改这里。
@@ -123,6 +127,7 @@ jobs:
     # required 只勾：fmt / clippy / test / msrv / deny。
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: ${{ env.WORKDIR }}
@@ -137,9 +142,32 @@ jobs:
       # 只 build 只能抓 LTO/链接类问题，test 能覆盖前两类。
       - run: cargo test --locked --release
 
+  release-check:
+    name: Release Check (PR only)
+    # 只在 PR 上跑 release 编译，抓 LTO/链接类问题。
+    # main 上由 release-test 跑完整 release test，两者互斥，不重复。
+    # 【不要把这个 job 设为 required check】
+    # 原因同 release-test：PR 上会跑，但 push main 时是 skipped。
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.WORKDIR }}
+      # 只 build 不 test，速度比 cargo test --release 快，
+      # 足以在 PR 阶段暴露 LTO / codegen-units / 链接错误。
+      - run: cargo build --locked --release
+
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # 前置条件（缺一不可，否则这个 job 会红）：
     # 1. deny.toml 必须放在 ${{ env.WORKDIR }} 下，和 working-directory 一致，
     #    不是仓库根目录。
@@ -152,3 +180,24 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           working-directory: ${{ env.WORKDIR }}
+
+  doc:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # 把文档警告当错误，避免 docs.rs 构建失败才发现问题。
+    # 例如 broken intra-doc link、无效的 doc attribute、HTML 标签未闭合等。
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    defaults:
+      run:
+        working-directory: ${{ env.WORKDIR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.WORKDIR }}
+      # --no-deps：只构建本 crate 的文档，不构建依赖的文档，省时间。
+      # --all-features：把所有 feature 打开，避免某个 feature 下的文档有警告却漏检。
+      - run: cargo doc --locked --no-deps --all-features
