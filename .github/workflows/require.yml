@@ -21,14 +21,29 @@ jobs:
         run: |
           expected="New version of The Xiyi Language"
 
-          # 1) It must contain ASCII characters only. (bytes in the range from 0x00 to 0x7F)
-          if printf '%s' "$TITLE" | LC_ALL=C grep -q '[^[:ascii:]]'; then
+          # 0) 判断是否意图为版本发布。
+          #    触发条件：标题（不区分大小写）同时包含 "version" 和 "xiyi"。
+          #    只有满足这个条件，才进入后续严格校验；否则一律放行。
+          lowered="$(printf '%s' "$TITLE" | tr '[:upper:]' '[:lower:]')"
+
+          if ! printf '%s' "$lowered" | grep -q 'version' \
+             || ! printf '%s' "$lowered" | grep -q 'xiyi'; then
+            echo "Title does not look like a version release PR."
+            echo "Skipping validation. Current title: \"$TITLE\""
+            exit 0
+          fi
+
+          # 到这里，认为意图是版本发布，开始严格校验。
+
+          # 1) 必须是纯 ASCII。
+          #    用 tr 删掉所有 ASCII 字节（\0-\177），若还有剩余即非 ASCII。
+          if [ -n "$(printf '%s' "$TITLE" | LC_ALL=C tr -d '\0-\177')" ]; then
             echo "::error::PR title must contain ASCII characters only (no Unicode)."
             echo "Current title: \"$TITLE\""
             exit 1
           fi
 
-          # 2) It must be an exact match.
+          # 2) 必须精确匹配。
           if [ "$TITLE" != "$expected" ]; then
             echo "::error::The changing title must be: \"$expected\""
             echo "However, the current wording is: \"$TITLE\""
