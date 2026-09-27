@@ -100,6 +100,36 @@ impl Parser {
                     kind: ExprKind::Literal(Literal::ByteString(bytes)),
                 }))
             }
+            // 关键新增：字符字面量 'a'。跟字符串字面量是同一套故事——
+            // Lexer 已经把 \n/\t/\xNN/\u{...} 这些转义序列解码成实际
+            // 字符了，这里只需要剥掉包裹用的单引号。空字符字面量 `''`
+            // （规范里明确非法，字符字面量不能为空）、剥完引号后不止
+            // 剩一个字符（正常不该出现，防御性检查）都如实报错，不
+            // 装作侥幸猜一个字符——这两种情况理论上应该在词法阶段就被
+            // 拦下（error[LEX003] 之类），但 parser 这层不应该假设
+            // Lexer 绝对不会把问题漏过来。
+            Some((Token::CharLit, value)) => {
+                self.next();
+                let inner = value
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .unwrap_or_else(|| value.as_str());
+                let mut chars = inner.chars();
+                let ch = match chars.next() {
+                    Some(c) => c,
+                    None => return Some(Err("empty char literal".to_string())),
+                };
+                if chars.next().is_some() {
+                    return Some(Err(format!(
+                        "char literal contains more than one character: {}",
+                        value
+                    )));
+                }
+                Some(Ok(Expr {
+                    id: self.next_expr_id(),
+                    kind: ExprKind::Literal(Literal::Char(ch)),
+                }))
+            }
             Some((Token::True, _)) => {
                 self.next();
                 Some(Ok(Expr {

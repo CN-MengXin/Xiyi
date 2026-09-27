@@ -72,6 +72,11 @@ impl Parser {
                 return self.parse_binding(true, false);
             }
             Some((Token::Break, _)) => return self.parse_break_stmt(),
+            // 关键新增：AST 里 Stmt::Continue 早就有了，但 parser 一直
+            // 没有对应的入口——`continue;` 会落到下面"当成表达式语句"
+            // 那条兜底路径，parse_expr 认不出 Token::Continue，报一句
+            // 跟"这是个 continue 语句"毫无关系的 "Expected expression"。
+            Some((Token::Continue, _)) => return self.parse_continue_stmt(),
             Some((Token::Return, _)) => return self.parse_return_stmt(),
             Some((Token::While, _)) => return self.parse_while_stmt(),
             Some((Token::For, _)) => return self.parse_for_stmt(),
@@ -166,6 +171,15 @@ impl Parser {
         self.expect(Token::Break)?;
         self.expect(Token::Semicolon)?;
         Ok(Stmt::Break(BreakStmt {}))
+    }
+
+    // 跟 parse_break_stmt 是同一个套路：continue 语句本身不携带任何
+    // 数据，只是"跳到循环头、进入下一轮"的标记，语法上就是关键字加
+    // 分号。
+    pub(crate) fn parse_continue_stmt(&mut self) -> Result<Stmt, String> {
+        self.expect(Token::Continue)?;
+        self.expect(Token::Semicolon)?;
+        Ok(Stmt::Continue(ContinueStmt {}))
     }
 
     pub(crate) fn parse_loop_stmt(&mut self) -> Result<Stmt, String> {

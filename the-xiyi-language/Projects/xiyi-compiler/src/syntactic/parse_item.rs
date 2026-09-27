@@ -44,6 +44,13 @@ impl Parser {
             Some((Token::Model, _)) => Ok(vec![Item::ModelDef(self.parse_model(attrs)?)]),
             Some((Token::Implement, _)) => Ok(vec![self.parse_implement_def(attrs)?]),
             Some((Token::Interface, _)) => Ok(vec![self.parse_interface_def(attrs)?]),
+            // 关键新增：AST 里 Item::ProtoDef 早就有了（Actor 消息协议
+            // proto TrainProto { Update(...), QueryWeights, ... }），但
+            // parser 一直没有对应的入口——`proto` 会落到 parse_item 最后
+            // 的兜底分支，报"Expected function, model, implement,
+            // interface, use, struct, enum, or const definition"，
+            // 完全看不出问题出在 proto 没接上。
+            Some((Token::Proto, _)) => Ok(vec![Item::ProtoDef(self.parse_proto_def()?)]),
             Some((Token::Use, _)) => {
                 if !attrs.is_empty() {
                     return Err("Attributes not allowed on use statement".to_string());
@@ -243,6 +250,42 @@ impl Parser {
             generic_params,
             methods,
         }))
+    }
+
+    // ===== parse_proto_def =====
+    // proto 定义 Actor 的编译期消息接口契约：一串变体，每个变体可选
+    // 携带一个参数类型（`Update(Gradient<...>)`）或者不带参数
+    // （`QueryWeights`）。结构上跟 enum 很像（都是"一串带名字、可选
+    // 带一个类型参数的变体"），但语义完全不同（proto 是 Actor 消息
+    // 协议，不是数据类型），AST 里 ProtoDef/ProtoVariant 也是独立的
+    // 结构体，不是复用 EnumDef/EnumVariant，这里也不去共享解析函数，
+    // 照 EnumDef 的读法单独写一份，保持"这是 proto，不是 enum"的界限
+    // 清楚。
+    pub(crate) fn parse_proto_def(&mut self) -> Result<ProtoDef, String> {
+        self.expect(Token::Proto)?;
+        let name = self.parse_ident()?;
+        self.expect(Token::LBrace)?;
+        let mut variants = Vec::new();
+        while let Some((token, _)) = self.peek() {
+            if *token == Token::RBrace {
+                break;
+            }
+            let variant_name = self.parse_ident()?;
+            let ty = if let Some((Token::LParen, _)) = self.peek() {
+                self.next();
+                let t = self.parse_type()?;
+                self.expect(Token::RParen)?;
+                Some(t)
+            } else {
+                None
+            };
+            variants.push(ProtoVariant { name: variant_name, ty });
+            if let Some((Token::Comma, _)) = self.peek() {
+                self.next();
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(ProtoDef { name, variants })
     }
 
     // ===== parse_struct_def（支持泛型） =====

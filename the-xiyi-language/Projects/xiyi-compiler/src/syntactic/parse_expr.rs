@@ -236,24 +236,121 @@ impl Parser {
                     },
                 })
             }
+            // 关键新增：取地址 &x / &mut x。之前完全没处理 Token::Amp，
+            // `&x` 会一路落到 parse_primary 的兜底分支报 "Expected
+            // expression"——AST 早就有 ExprKind::Ref { mutable, expr }
+            // 这个节点（对应 &self.check_call_arg 这类到处在用的写法），
+            // parser 却从来产不出来。
+            Some((Token::Amp, _)) => {
+                self.next();
+                let mutable = if let Some((Token::Mut, _)) = self.peek() {
+                    self.next();
+                    true
+                } else {
+                    false
+                };
+                let expr = self.parse_unary()?;
+                Ok(Expr {
+                    id: self.next_expr_id(),
+                    kind: ExprKind::Ref {
+                        mutable,
+                        expr: Box::new(expr),
+                    },
+                })
+            }
+            // 关键新增：解引用 *p。跟上面 Amp 是同一个坑——Token::Star
+            // 之前只在 parse_mul 里当二元乘号处理，一元解引用完全没有
+            // 入口，`*p` 会被 parse_mul 硬拆成"缺左操作数的乘法"报错。
+            //
+            // parse_unary 在 parse_mul 之下（优先级更高、更早被尝试），
+            // 所以 `*p + 1` 这里会先把 `*p` 解析成一个整体的一元解引用
+            // 表达式，再交给外层的 parse_add/parse_mul 处理 `+ 1`，
+            // 结果是 `(*p) + 1`——这正是我们想要的优先级，`*` 只在两侧
+            // 都已经有操作数、且不是紧跟在另一个表达式后面时才会被
+            // parse_mul 当成乘号消费到（比如 `a * p`，`a` 已经在
+            // parse_mul 循环里被当成左操作数读出来了，不会重新进
+            // parse_unary）。
+            Some((Token::Star, _)) => {
+                self.next();
+                let expr = self.parse_unary()?;
+                Ok(Expr {
+                    id: self.next_expr_id(),
+                    kind: ExprKind::Deref(Box::new(expr)),
+                })
+            }
             _ => self.parse_postfix(),
         }
     }
 
-    // ===== 后缀索引 bytes[i]，支持连续 arr[i][j] =====
+    // ===== 后缀运算：连续的 .field / .method(args) / [index]，任意顺序混合 =====
+    // 关键修复（十）：这两种后缀操作原来是两个各自独立成环的函数——
+    // 这里的 `[i]` 循环，和已经删掉的 parse_dot_chain 的 `.field`/
+    // `.method()` 循环——谁先遇到对方的 token 就直接收手不认。
+    // `a[i].b` 解析完 `a[i]` 之后，原来的 parse_postfix 循环条件只认
+    // LBracket，遇到紧跟着的 `.` 直接退出返回，`.b` 变成没人处理的
+    // 残留 token，交给上一层报出一个跟真实原因（后缀运算符没合并）
+    // 对不上的错误。现在合并成一个循环，每一轮先看当前 token 是 `[`
+    // 还是 `.`，处理完继续下一轮，两种都不是才退出——`a[i].b`、
+    // `a.b[i]`、`a[i][j].b.c()` 这类任意顺序混合的写法都能正确处理。
+    // parse_primary 里原来在 SelfLower/SelfType/Ident 分支结尾各自调用
+    // parse_dot_chain 的地方，现在都改回直接返回裸的 expr——点链和索引
+    // 统一由外层的这个 parse_postfix 循环处理，parse_primary 不用再管。
     pub(crate) fn parse_postfix(&mut self) -> Result<Expr, String> {
         let mut expr = self.parse_primary()?;
-        while let Some((Token::LBracket, _)) = self.peek() {
-            self.next();
-            let index = self.parse_expr()?;
-            self.expect(Token::RBracket)?;
-            expr = Expr {
-                id: self.next_expr_id(),
-                kind: ExprKind::Index {
-                    expr: Box::new(expr),
-                    index: Box::new(index),
-                },
-            };
+        loop {
+            match self.peek() {
+                Some((Token::LBracket, _)) => {
+                    self.next();
+                    let index = self.parse_expr()?;
+                    self.expect(Token::RBracket)?;
+                    expr = Expr {
+                        id: self.next_expr_id(),
+                        kind: ExprKind::Index {
+                            expr: Box::new(expr),
+                            index: Box::new(index),
+                        },
+                    };
+                }
+                Some((Token::Dot, _)) => {
+                    self.next();
+                    let field_name = self.parse_ident()?;
+                    // 项目约定不使用任何 Rust 宏（包括 matches!），
+                    // is_call 的判断用显式 match 写。
+                    let is_call = match self.peek() {
+                        Some((Token::LParen, _)) => true,
+                        _ => false,
+                    };
+                    if is_call {
+                        self.next();
+                        let args = self.parse_call_args()?;
+                        self.expect(Token::RParen)?;
+                        let mut all_args = vec![CallArg::Positional(expr)];
+                        all_args.extend(args);
+                        expr = Expr {
+                            id: self.next_expr_id(),
+                            kind: ExprKind::Call {
+                                qualifier: None,
+                                func: field_name,
+                                // 方法调用目前不支持 `.method::<T>(...)`
+                                // 这种显式泛型实参写法，跟别的 Call
+                                // 构造点一样先占位一个空 Vec。
+                                generic_args: Vec::new(),
+                                args: all_args,
+                                is_method: true,
+                            },
+                        };
+                    } else {
+                        expr = Expr {
+                            id: self.next_expr_id(),
+                            kind: ExprKind::FieldAccess {
+                                struct_expr: Box::new(expr),
+                                field_name,
+                            },
+                        };
+                    }
+                }
+                _ => break,
+            }
         }
         Ok(expr)
     }
@@ -305,6 +402,7 @@ impl Parser {
                         kind: ExprKind::Call {
                             qualifier: None,
                             func: "closure_call".to_string(),
+                            generic_args: Vec::new(),
                             args: all_args,
                             is_method: false,
                         },
@@ -316,12 +414,12 @@ impl Parser {
             // ===== 处理 self（方法调用接收者） =====
             Some((Token::SelfLower, _)) => {
                 self.next(); // consume 'self'
-                let expr = Expr {
+                // 点链/索引现在统一交给外层 parse_postfix 处理，这里
+                // 只管把 `self` 本身构造出来。
+                Ok(Expr {
                     id: self.next_expr_id(),
                     kind: ExprKind::Ident("self".to_string()),
-                };
-                // 点链 .xxx 或 .xxx() 统一交给 parse_dot_chain 处理。
-                self.parse_dot_chain(expr)
+                })
             }
             // ===== SelfType 分支 =====
             Some((Token::SelfType, _)) => {
@@ -334,6 +432,7 @@ impl Parser {
                         id: self.next_expr_id(),
                         kind: ExprKind::StructInit {
                             struct_name: "Self".to_string(),
+                            generic_args: Vec::new(),
                             fields,
                         }
                     }
@@ -344,7 +443,7 @@ impl Parser {
                     }
                 };
 
-                self.parse_dot_chain(expr)
+                Ok(expr)
             }
             Some((Token::Unsafe, _)) => {
                 let unsafe_stmt = self.parse_unsafe_block()?;
@@ -369,11 +468,87 @@ impl Parser {
                     }
                 }
 
+                // ===== 关键新增：`::<...>` 显式泛型实参 =====
+                // try_read_path_segment 假定 `::` 后面紧跟的是一段普通
+                // 标识符（Ident::Ident 限定名），拿不下 `::` 后面紧跟
+                // `<` 的情况——`identity::<i32>(1)`、
+                // `Box::<i32> { value: 1 }`、`Option::<i32>::None` 这些
+                // 显式实例化写法都走不到这里。这里在真正调用
+                // try_read_path_segment 之前先探一步（peek 当前是不是
+                // `::`、再 peek 下一个是不是 `<`），命中就走这条专门的
+                // 泛型实参路径，读完 `::<...>` 之后再看紧跟的是
+                // `(`（函数/元组变体调用）、`{`（结构体初始化）还是
+                // 第二个 `::`（枚举变体构造）来决定构造哪种节点。
+                if let Some((Token::PathSep, _)) = self.peek() {
+                    if let Some((Token::Lt, _)) = self.peek_nth(1) {
+                        self.next(); // consume '::'
+                        let generic_args = self.parse_generic_args()?;
+
+                        if let Some((Token::LParen, _)) = self.peek() {
+                            self.next();
+                            let args = self.parse_call_args()?;
+                            self.expect(Token::RParen)?;
+                            return Ok(Expr {
+                                id: self.next_expr_id(),
+                                kind: ExprKind::Call {
+                                    qualifier: None,
+                                    func: func_name,
+                                    generic_args,
+                                    args,
+                                    is_method: false,
+                                },
+                            });
+                        }
+
+                        if let Some((Token::LBrace, _)) = self.peek() {
+                            self.next();
+                            let fields = self.parse_struct_fields()?;
+                            return Ok(Expr {
+                                id: self.next_expr_id(),
+                                kind: ExprKind::StructInit {
+                                    struct_name: name,
+                                    generic_args,
+                                    fields,
+                                },
+                            });
+                        }
+
+                        if let Some((Token::PathSep, _)) = self.peek() {
+                            self.next();
+                            let variant_name = self.parse_ident()?;
+                            if let Some((Token::LParen, _)) = self.peek() {
+                                self.next();
+                                let args = self.parse_call_args()?;
+                                self.expect(Token::RParen)?;
+                                return Ok(Expr {
+                                    id: self.next_expr_id(),
+                                    kind: ExprKind::EnumVariantConstruction {
+                                        enum_name: name,
+                                        generic_args,
+                                        variant_name,
+                                        args,
+                                    },
+                                });
+                            }
+                            // AST 里 EnumVariantAccess 没有 generic_args
+                            // 字段，`Option::<i32>::None` 这种写法目前
+                            // 表示不了，如实报错而不是悄悄丢掉泛型实参。
+                            return Err(
+                                "generic args on EnumVariantAccess are not supported yet".to_string(),
+                            );
+                        }
+
+                        return Err("expected '(' or '{' or '::' after generic args".to_string());
+                    }
+                }
+
                 // ===== PathSep 分支（生成 EnumVariantConstruction） =====
                 // "peek 到 :: 就消费并读下一段"这条原语现在收在
                 // parse_path.rs 的 try_read_path_segment 里——跟
                 // parse_pattern.rs 读 Ident::Ident 限定名时用的是同一个
-                // 函数，不用各自手写一遍。
+                // 函数，不用各自手写一遍。上面已经把 `::<...>` 那条路
+                // 拦掉了，走到这里说明 `::` 后面不是 `<`，正常按
+                // "下一段是标识符"处理。
                 if let Some(result) = self.try_read_path_segment() {
                     let variant_name = result?;
 
@@ -386,6 +561,7 @@ impl Parser {
                             id: self.next_expr_id(),
                             kind: ExprKind::EnumVariantConstruction {
                                 enum_name: name,
+                                generic_args: Vec::new(),
                                 variant_name: variant_name,
                                 args: args,
                             },
@@ -410,6 +586,7 @@ impl Parser {
                         kind: ExprKind::Call {
                             qualifier: None,
                             func: func_name,
+                            generic_args: Vec::new(),
                             args,
                             is_method: false,
                         },
@@ -425,19 +602,19 @@ impl Parser {
                         id: self.next_expr_id(),
                         kind: ExprKind::StructInit {
                             struct_name: name.clone(),
+                            generic_args: Vec::new(),
                             fields,
                         },
                     };
-                    return self.parse_dot_chain(expr);
+                    return Ok(expr);
                     }
                 }
 
-                // 普通标识符 + 点链
-                let expr = Expr {
+                // 普通标识符。点链/索引统一交给外层 parse_postfix 处理。
+                Ok(Expr {
                     id: self.next_expr_id(),
                     kind: ExprKind::Ident(name),
-                };
-                self.parse_dot_chain(expr)
+                })
             }
             // 关键：try_parse_unit_literal 已经在函数开头把 `()` 这种
             // 情况处理掉了，走到这里的 LParen 一定不是单元字面量，直接
@@ -489,51 +666,6 @@ impl Parser {
                 ))
             }
         }
-    }
-
-    // ===== 点链：`.field` / `.method(args)` 连续访问 =====
-    // 从 parse_primary 的 SelfLower、SelfType、Ident（含 Ident 分支内部
-    // 走结构体初始化那条路）四个位置抽出来的公共逻辑——原来这四处各自
-    // 内联一份逐字符相同的 while 循环，以后想改点链的规则（比如支持
-    // `?.` 之类）要同时改四个地方，容易漏改。现在四处各自只负责构造好
-    // 点链要作用的初始 expr，剩下的全部交给这一个函数。
-    //
-    // 项目约定不使用任何 Rust 宏（包括 matches!），is_call 的判断用
-    // 显式 match 写，不走 matches! 宏。
-    pub(crate) fn parse_dot_chain(&mut self, mut expr: Expr) -> Result<Expr, String> {
-        while let Some((Token::Dot, _)) = self.peek() {
-            self.next();
-            let field_name = self.parse_ident()?;
-            let is_call = match self.peek() {
-                Some((Token::LParen, _)) => true,
-                _ => false,
-            };
-            if is_call {
-                self.next();
-                let args = self.parse_call_args()?;
-                self.expect(Token::RParen)?;
-                let mut all_args = vec![CallArg::Positional(expr)];
-                all_args.extend(args);
-                expr = Expr {
-                    id: self.next_expr_id(),
-                    kind: ExprKind::Call {
-                        qualifier: None,
-                        func: field_name,
-                        args: all_args,
-                        is_method: true,
-                    },
-                };
-            } else {
-                expr = Expr {
-                    id: self.next_expr_id(),
-                    kind: ExprKind::FieldAccess {
-                        struct_expr: Box::new(expr),
-                        field_name,
-                    },
-                };
-            }
-        }
-        Ok(expr)
     }
 
     // ===== 结构体初始化字段（支持简写） =====

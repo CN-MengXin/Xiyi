@@ -45,7 +45,14 @@ impl Parser {
             if name == "Tensor" {
                 self.next();
                 self.expect(Token::Lt)?;
-                let dtype = Box::new(self.parse_base_type()?);
+                // 关键修复：这里原来递归调 parse_base_type，拿不到
+                // parse_type 才处理的 `&`（引用）和隐私标签这两层——
+                // Tensor<&str, [3]> 这种（不太常见但语法上合法）写法
+                // 会在 dtype 位置直接报错。parse_type 内部本来就是先调
+                // parse_base_type 再看要不要包一层引用/隐私标签，改成
+                // 调 parse_type 不会丢失任何原来能解析的形态，只是把
+                // 能接受的范围扩大到跟"类型出现的任何其它位置"一致。
+                let dtype = Box::new(self.parse_type()?);
                 self.expect(Token::Comma)?;
                 let shape = self.parse_shape()?;
                 self.expect(Token::Gt)?;
@@ -89,7 +96,14 @@ impl Parser {
                     let mut args = Vec::new();
                     while let Some((token, _)) = self.peek() {
                         if *token == Token::Gt { break; }
-                        let ty = self.parse_base_type()?;
+                        // 关键修复：同上，改成 parse_type 而不是
+                        // parse_base_type——`Vec<&str>`、
+                        // `Vec<Tensor<f32, [3]><dp(1/1)>>` 这类泛型实参
+                        // 带引用或隐私标签的写法，原来在这里会直接报
+                        // "Expected type"（parse_base_type 不认识开头
+                        // 的 `&`），而它们在类型出现的其它位置都是
+                        // 合法的。
+                        let ty = self.parse_type()?;
                         args.push(ty);
                         if let Some((Token::Comma, _)) = self.peek() {
                             self.next();
