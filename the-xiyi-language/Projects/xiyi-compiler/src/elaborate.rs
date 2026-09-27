@@ -300,6 +300,10 @@ impl Elaborate {
                 Ok(HirStmt::Loop { body, span })
             }
             HirStmt::Break { span } => Ok(HirStmt::Break { span }),
+            // 关键新增：对应 hir.rs 新增的 HirStmt::Continue——跟 Break
+            // 是同一个模式，语句本身不携带需要展开的子表达式，原样
+            // 转发。
+            HirStmt::Continue { span } => Ok(HirStmt::Continue { span }),
             HirStmt::UnsafeBlock { kind, body, span } => {
                 let body = Self::elaborate_block(body, ctx)?;
                 Ok(HirStmt::UnsafeBlock { kind, body, span })
@@ -607,6 +611,21 @@ impl Elaborate {
             }
 
             HirExprKind::LackSlice(_) => Ok(expr),
+
+            // ===== 新增：取地址 &x / &mut x、解引用 *p =====
+            // 跟 Unary/Cast 是同一个模式——内部只有一个 Box<HirExpr> 子
+            // 表达式需要递归展开，用 elaborate_boxed 处理。
+            HirExprKind::Ref { mutable, expr: inner } => {
+                expr.kind = HirExprKind::Ref {
+                    mutable,
+                    expr: Self::elaborate_boxed(inner, ctx)?,
+                };
+                Ok(expr)
+            }
+            HirExprKind::Deref(inner) => {
+                expr.kind = HirExprKind::Deref(Self::elaborate_boxed(inner, ctx)?);
+                Ok(expr)
+            }
         }
     }
 
@@ -825,6 +844,7 @@ impl Elaborate {
             HirStmt::Assign { target, expr, .. } => vec![target.as_ref(), expr],
             HirStmt::UnsafeBlock { body, .. } => Self::block_exprs(body),
             HirStmt::Break { .. } => vec![],
+            HirStmt::Continue { .. } => vec![],
         }
     }
 }

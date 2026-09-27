@@ -164,9 +164,11 @@ impl HirBuilder {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(HirImplement {
+            attributes: imp.attributes.clone(),
             generic_params: Self::build_generic_params(&imp.generic_params),
             target_type: imp.target_type.clone(),
             interface_name: imp.interface_name.clone(),
+            where_clause: imp.where_clause.clone(),
             functions,
         })
     }
@@ -191,6 +193,7 @@ impl HirBuilder {
             .collect();
 
         Ok(HirInterface {
+            attributes: iface.attributes.clone(),
             name: iface.name.clone(),
             generic_params: Self::build_generic_params(&iface.generic_params),
             methods,
@@ -267,6 +270,7 @@ impl HirBuilder {
         });
 
         Ok(HirModel {
+            attributes: m.attributes.clone(),
             name: m.name.clone(),
             generic_params,
             fields,
@@ -315,6 +319,7 @@ impl HirBuilder {
         let sensitivity = None;
 
         Ok(HirFn {
+            attributes: f.attributes.clone(),
             name: f.name.clone(),
             generic_params: Self::build_generic_params(&f.generic_params),
             params,
@@ -398,6 +403,13 @@ impl HirBuilder {
                         span: Span::default(),
                     });
                 }
+                // 关键新增：对应 ast::Stmt::Continue——跟 Break 是同一个
+                // 模式，语句本身不携带数据，原样转述成 HirStmt::Continue。
+                Stmt::Continue(_) => {
+                    stmts.push(HirStmt::Continue {
+                        span: Span::default(),
+                    });
+                }
                 Stmt::UnsafeBlock(unsafe_block) => {
                     let body = Self::build_block(&unsafe_block.body, expr_types)?;
                     stmts.push(HirStmt::UnsafeBlock {
@@ -452,6 +464,7 @@ impl HirBuilder {
             ExprKind::Call {
                 qualifier,
                 func,
+                generic_args,
                 args,
                 is_method,
             } => {
@@ -463,10 +476,13 @@ impl HirBuilder {
                 HirExprKind::Call {
                     qualifier: qualifier.clone(),
                     func: func.clone(),
-                    // TODO(sema): 目前 ast::ExprKind::Call 还没有显式泛型实参语法（如
-                    // identity::<i32>(1)），先占位空 Vec，等 parser/ast 支持后这里改成
-                    // 从 ast 侧透传
-                    generic_args: Vec::new(),
+                    // 关键修复：ast::ExprKind::Call 现在已经有真正的
+                    // generic_args 字段了（支持 `identity::<i32>(1)`
+                    // 这种显式实例化），原来这里因为 ast 侧还没有这个
+                    // 语法，只能先占位空 Vec；现在直接从 ast 节点透传，
+                    // 不用等 sema 真正实现泛型替换才能把这份信息带到
+                    // HIR——早一层透传，晚一层用，互不阻塞。
+                    generic_args: generic_args.clone(),
                     args: hir_args,
                     is_method: *is_method,
                 }
@@ -478,6 +494,7 @@ impl HirBuilder {
             }
             ExprKind::StructInit {
                 struct_name,
+                generic_args,
                 fields,
             } => {
                 let hir_fields: Vec<(String, HirExpr)> = fields
@@ -490,7 +507,7 @@ impl HirBuilder {
                 effects = Self::merge_effects(hir_fields.iter().map(|(_, e)| e));
                 HirExprKind::StructInit {
                     struct_name: struct_name.clone(),
-                    generic_args: Vec::new(),
+                    generic_args: generic_args.clone(),
                     fields: hir_fields,
                 }
             }
@@ -524,6 +541,7 @@ impl HirBuilder {
             // ===== 新增：枚举变体构造 =====
             ExprKind::EnumVariantConstruction {
                 enum_name,
+                generic_args,
                 variant_name,
                 args,
             } => {
@@ -532,8 +550,9 @@ impl HirBuilder {
 
                 HirExprKind::EnumVariantConstruction {
                     enum_name: enum_name.clone(),
-                    // TODO(sema): 同 Call，ast 侧暂无显式泛型实参，先占位空 Vec
-                    generic_args: Vec::new(),
+                    // 关键修复：同 Call，ast 侧现在有真正的 generic_args
+                    // 了，直接透传。
+                    generic_args: generic_args.clone(),
                     variant_name: variant_name.clone(),
                     args: hir_args,
                 }
@@ -639,6 +658,21 @@ impl HirBuilder {
             // effects 保持默认（全 false），不用合并任何子表达式的副作用
             // （它本来就没有子表达式）。
             ExprKind::LackSlice(ty) => HirExprKind::LackSlice(ty.clone()),
+            // ===== 新增：取地址 &x / &mut x =====
+            ExprKind::Ref { mutable, expr } => {
+                let inner = Self::build_expr(expr, expr_types)?;
+                effects = inner.effects.clone();
+                HirExprKind::Ref {
+                    mutable: *mutable,
+                    expr: Box::new(inner),
+                }
+            }
+            // ===== 新增：解引用 *p =====
+            ExprKind::Deref(expr) => {
+                let inner = Self::build_expr(expr, expr_types)?;
+                effects = inner.effects.clone();
+                HirExprKind::Deref(Box::new(inner))
+            }
         };
 
         Ok(Self::mk_expr(kind, ty, effects, Span::default()))

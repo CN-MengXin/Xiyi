@@ -18,7 +18,7 @@ use crate::ast::Type;
 // ast.rs 导入，不依赖某个中间模块顺手公开转发了它这件事。
 use crate::ast::Literal;
 use crate::mir::*;
-use crate::mir_builder::{LoopCtx, MirBuilder};
+use crate::mir_builder::{LoopCtx, LoopPhiInfo, MirBuilder};
 use std::collections::HashMap;
 
 impl MirBuilder {
@@ -247,16 +247,31 @@ impl MirBuilder {
         }
     }
 
-    // -------- 循环栈（给 break 用） --------
+    // -------- 循环栈（给 break / continue 用） --------
     // 关键新增：跟 push_scope/pop_scope 配套，在进入 While/Loop 的循环
     // 体之前调用——此时循环体自己的 push_scope 还没发生，记下的
     // scope_depth 就是"循环体之外"的作用域层数，break 时用它切出
     // "循环体内部、该被跳过并补 Drop"的那一段 scope_vars（见 LoopCtx
     // 定义处的注释）。
-    pub(crate) fn push_loop(&mut self, break_target: usize) {
+    //
+    // 关键修复（continue 支持）：签名加了 continue_target 和
+    // loop_phis 两个参数——continue 语句既要知道"跳到哪继续下一轮"
+    // （continue_target），也要知道"循环头有哪些 Phi 需要给这条新增
+    // 的回边补一个 incoming"（loop_phis）。两者都是调用点
+    // （mir_builder.rs 的 While/Loop 分支）在插好循环头 Phi、算出
+    // continue 该去的块之后就已经手上有的信息，这里只是原样存进
+    // LoopCtx，供之后 HirStmt::Continue 分支从栈顶取用。
+    pub(crate) fn push_loop(
+        &mut self,
+        continue_target: usize,
+        break_target: usize,
+        loop_phis: Vec<LoopPhiInfo>,
+    ) {
         self.loop_stack.push(LoopCtx {
+            continue_target,
             break_target,
             scope_depth: self.scope_vars.len(),
+            loop_phis,
         });
     }
 

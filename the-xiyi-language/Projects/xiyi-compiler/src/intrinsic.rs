@@ -563,10 +563,38 @@ pub fn is_dynamic_intrinsic(name: IntrinsicFn) -> bool {
     }
 }
 
+/// 内建函数现在没有一个声明泛型参数（print/panic/from_utf8_unchecked
+/// 签名固定，张量算子的类型靠接收者驱动，不靠显式实参）。但
+/// `ExprKind::Call` 现在天然带 `generic_args`，`print::<i32>("x")`
+/// 这种写法在语法上是合法的——不能因为走到内建分支就把它悄悄丢掉、
+/// 假装用户没写。调用方（静态与动态两条路径）都必须先过这一关，
+/// 写了非空 generic_args 就报错，不允许内建函数接受任何显式泛型实参。
+pub fn check_no_generic_args(
+    name: IntrinsicFn,
+    generic_args: &[Type],
+) -> Result<(), String> {
+    if generic_args.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "intrinsic `{:?}` does not accept explicit generic arguments",
+            name
+        ))
+    }
+}
+
 /// 静态内建函数的类型检查总入口。调用方（check_expr.rs 的
 /// check_static_intrinsic_call）已经过滤掉了 is_dynamic_intrinsic
 /// 为 true 的两个，这里的 match 对它们只放一个 unreachable 兜底。
-pub fn check_intrinsic_call(name: IntrinsicFn, ctx: &CallCtx) -> Result<CheckedResult, String> {
+///
+/// 关键新增：generic_args 参数——先统一校验"内建函数不接受显式泛型
+/// 实参"，再进入原来的按名字分派，下面各分支一个字符都不用动。
+pub fn check_intrinsic_call(
+    name: IntrinsicFn,
+    generic_args: &[Type],
+    ctx: &CallCtx,
+) -> Result<CheckedResult, String> {
+    check_no_generic_args(name, generic_args)?;
     match name {
         IntrinsicFn::Print => check_print(ctx),
         IntrinsicFn::Panic => check_panic(ctx),

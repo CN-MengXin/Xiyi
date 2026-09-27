@@ -57,10 +57,27 @@ pub(crate) struct SharedContext {
 // 要在跳走之前补 Drop——但循环体之外（scope_depth 那一层以下）的作用域
 // 不受 break 影响，仍然活着，不能碰。用这个深度值就能精确切出
 // "该 Drop 哪一段 scope_vars"，不多不少。
-#[derive(Clone, Copy)]
+//
+// 关键新增（continue 支持）：continue_target 是"跳到哪继续下一轮"——
+// While 是 cond_block（continue 之后还要重新判断条件），Loop 是
+// body_block（没有独立的条件块，body 本身就是循环头）。跟
+// break_target 是同一层含义，只是去处不同。
+//
+// loop_phis 是这一层循环头（insert_loop_header_phis 在进入循环体之前
+// 插好的那批 Phi）的完整信息，continue 需要它：continue 语句本身就是
+// "提前绕回循环头"，相当于凭空多出一条回边，这条回边也必须成为循环头
+// 每一个 Phi 的 incoming 之一，不然从 continue 路径进来的值就会在 SSA
+// 层面凭空消失——循环头读到的 Phi 只汇合了"正常走到循环体尾部"和
+// "从 preheader 进来"这两条边，continue 单独开辟的这条近道被漏掉了。
+// 这也是 LoopCtx 从 `#[derive(Clone, Copy)]` 降级成只 `#[derive(Clone)]`
+// 的原因——Vec 不是 Copy，Copy 语义没法再要了；push_loop/State 里读它
+// 的地方相应地要么 clone 一份、要么借用。
+#[derive(Clone)]
 pub(crate) struct LoopCtx {
+    pub(crate) continue_target: usize,
     pub(crate) break_target: usize,
     pub(crate) scope_depth: usize,
+    pub(crate) loop_phis: Vec<LoopPhiInfo>,
 }
 
 // 关键新增（循环头 Phi）：insert_loop_header_phis 插入的每一条 Phi，
@@ -68,10 +85,19 @@ pub(crate) struct LoopCtx {
 // loop_header_phis 需要知道"回去补哪一条"，这三个字段就是定位信息：
 // 插在哪个块（header_block）、块里第几条语句（stmt_index，Vec 下标，
 // 插入时就是 push 之前的长度）、对应哪个变量（base_id）。
-struct LoopPhiInfo {
-    header_block: usize,
-    stmt_index: usize,
-    base_id: usize,
+//
+// 关键修复（continue 支持）：字段和类型本身都改成 pub(crate)——
+// LoopCtx 现在把这份信息整个背在身上（塞进 loop_stack，栈本身在
+// state.rs 里），state.rs 的 push_loop 需要接收
+// `Vec<LoopPhiInfo>` 当参数、HirStmt::Continue 的处理需要读
+// `loop_ctx.loop_phis` 里每一项的三个字段，两处都跟 mir_builder.rs
+// 是不同的关注点划分（state.rs 管"构建期状态"，mir_builder.rs 管
+// "HIR 到 MIR 的翻译"），但都需要认识这个类型的完整内部结构。
+#[derive(Clone)]
+pub(crate) struct LoopPhiInfo {
+    pub(crate) header_block: usize,
+    pub(crate) stmt_index: usize,
+    pub(crate) base_id: usize,
 }
 
 // ===== 重构：把"发散"变成显式返回值，不再靠类型层反推 =====
@@ -295,10 +321,59 @@ impl MirBuilder {
         intrinsics_used.sort();
         intrinsics_used.dedup();
 
-        // TODO: consts / protos / interfaces 目前没有对应的 Mir* 结构，
-        // 先只覆盖 fns/structs/enums(+ 现在补上的 impls/models) 把主干
-        // 打通。
-        Ok(MirProgram { structs, enums, fns, intrinsics_used })
+        // 关键新增：consts/protos/interfaces 之前一直没有对应的 Mir*
+        // 结构，build() 只覆盖了 fns/structs/enums(+ impls/models)，
+        // 用户写的顶层 const、proto、interface 会被静默丢弃，走到
+        // codegen 时凭空消失。现在补上，跟 structs/enums 是同一个
+        // "从 Hir* 直接映射过来"的套路。
+        let consts = hir
+            .consts
+            .iter()
+            .map(|c| {
+                // 关键说明：const 的值在 HIR 里是一整棵表达式
+                // （HirConst.value: HirExpr），但 MIR 层的三地址码
+                // 原则要求右值必须是已经求好的操作数——真正"把这棵
+                // 表达式树求值/折叠成一个 MirOperand"，需要跑一遍
+                // build_expr 或者接入 calc.rs 的编译期求值，这两者都
+                // 还没做（build_expr 目前假设自己在某个函数体内部，
+                // 需要 MirBuilder 实例的 scope/block 状态，顶层 const
+                // 没有这些上下文）。先给一个明确占位的 Unit，保证
+                // consts 这张表至少存在、名字和类型不丢，比完全不
+                // 处理更好；真正的值折叠留到下一轮接。
+                MirConst {
+                    name: c.name.clone(),
+                    ty: c.ty.clone(),
+                    // TODO: 从 c.value 折叠出真正的常量，现在先给一个 Unit
+                    value: MirOperand::Constant(crate::ast::Literal::Unit),
+                }
+            })
+            .collect();
+
+        let protos = hir
+            .protos
+            .iter()
+            .map(|p| MirProto {
+                name: p.name.clone(),
+                variants: p.variants.iter().map(|v| (v.name.clone(), v.ty.clone())).collect(),
+            })
+            .collect();
+
+        let interfaces = hir
+            .interfaces
+            .iter()
+            .map(|i| MirInterface {
+                name: i.name.clone(),
+                generic_params: i.generic_params.clone(),
+                methods: i.methods.iter().map(|m| MirFnSig {
+                    name: m.name.clone(),
+                    generic_params: m.generic_params.clone(),
+                    params: m.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect(),
+                    return_type: m.return_type.clone(),
+                }).collect(),
+            })
+            .collect();
+
+        Ok(MirProgram { structs, enums, consts, protos, interfaces, fns, intrinsics_used })
     }
 
     fn collect_intrinsics_in_body(body: &MirBody) -> Vec<IntrinsicFn> {
@@ -607,12 +682,10 @@ impl MirBuilder {
                 // 编译失败就直接退出"的架构掩盖了这个问题（反正马上就
                 // 不再使用这个 MirBuilder 了），但不能依赖这个前提——
                 // 先存住结果，无论如何先 pop_loop，再 `?`。
-                self.push_loop(end_block);
+                self.push_loop(cond_block, end_block, loop_phis.clone());
                 let body_result = self.build_block(body, shared);
                 self.pop_loop();
                 let body_result = body_result?;
-
-                // 关键说明：body 是不是发散不影响 while 语句本身要不要
                 // 报告发散——循环外仍然可能通过"条件一开始就为假"这条
                 // 路径直接落到 end_block，while 语句永远不发散，这一点
                 // 跟原来的设计意图一致。
@@ -658,7 +731,7 @@ impl MirBuilder {
                 // "放在最前面"。
                 let loop_phis = self.insert_loop_header_phis(preheader_block, body);
 
-                self.push_loop(end_block);
+                self.push_loop(body_block, end_block, loop_phis.clone());
                 let body_result = self.build_block(body, shared);
                 self.pop_loop();
                 let body_result = body_result?;
@@ -690,7 +763,13 @@ impl MirBuilder {
                 // loop_stack 为空说明 break 出现在任何 while/loop 之外，
                 // sema.rs 应该已经拦住这种情况，这里报错而不是 panic，
                 // 方便定位是不是两边检查不一致。
-                let loop_ctx = self.loop_stack.last().copied().ok_or_else(|| {
+                //
+                // 关键修复（continue 支持带来的连带修改）：LoopCtx 现在
+                // 带着 `loop_phis: Vec<LoopPhiInfo>`，不再是 Copy 类型
+                // （Vec 不能 Copy），原来的 `.copied()` 编译不过，改成
+                // `.cloned()`——这里只需要读 break_target/scope_depth，
+                // 不碰 loop_phis，但既然要拿所有权就必须整个克隆一份。
+                let loop_ctx = self.loop_stack.last().cloned().ok_or_else(|| {
                     "internal error: HirStmt::Break 出现在循环之外 \
                      (sema.rs 的检查应该已经拦住这种情况，走到这里说明两边检查不一致)"
                         .to_string()
@@ -705,6 +784,52 @@ impl MirBuilder {
                 self.emit_drops_for_scopes(loop_ctx.scope_depth);
 
                 self.set_terminator(MirTerminator::Goto(loop_ctx.break_target));
+                Ok(Diverging::Diverged)
+            }
+            // 关键新增：对应 hir.rs 新增的 HirStmt::Continue——"跳到
+            // 循环头，进入下一轮"。跟 Break 几乎一样（同样要靠循环栈
+            // 找目标、同样要 Drop 掉循环体内部的作用域、同样让当前块
+            // 发散），唯一的、也是最容易漏掉的区别：continue 凭空多
+            // 造出了一条到循环头的回边，这条回边没有经过循环体正常
+            // 的"掉出尾部"路径，不会被 While/Loop 分支里
+            // finalize_loop_header_phis 那次收尾自动捕捉到——如果不在
+            // 这里手动把这条回边也记进循环头每一条 Phi 的 incoming，
+            // 从 continue 路径带着的那个值就会在 SSA 层面凭空消失：
+            // 循环头的 Phi 只会汇合"从 preheader 进来"和"从循环体
+            // 正常尾部绕回来"这两条边，continue 这条近道被漏掉，等于
+            // "continue 之前对某个变量的修改没有生效"这种运行时可见的
+            // bug。
+            HirStmt::Continue { .. } => {
+                let loop_ctx = self.loop_stack.last().cloned().ok_or_else(|| {
+                    "internal error: HirStmt::Continue 出现在循环之外 \
+                     (sema.rs 的检查应该已经拦住这种情况，走到这里说明两边检查不一致)"
+                        .to_string()
+                })?;
+
+                // 跟 Break 同样的道理：只 Drop 循环体自己的作用域，
+                // 循环外层还活着的作用域不能碰。
+                self.emit_drops_for_scopes(loop_ctx.scope_depth);
+
+                // 关键：continue 这条回边现在的 current_block 就是它的
+                // 来源块——把这个块和"此刻每个 Phi 变量的当前 SSA 版本"
+                // 追加进循环头对应 Phi 语句的 values 列表。这一步必须在
+                // 上面 emit_drops_for_scopes 之后做（Drop 不改变
+                // current_ssa 的结果，顺序其实不影响正确性，但逻辑上
+                // "先清理这一轮用完的局部变量，再把值带回循环头"更顺）、
+                // 必须在下面 set_terminator 之前做（没有先后依赖，但
+                // 放在发散之前，跟 Break/Return 里"先算完所有信息、
+                // 最后一步才发散"的顺序保持一致）。
+                let continue_block = self.current_block;
+                for info in &loop_ctx.loop_phis {
+                    let ssa = self.current_ssa(info.base_id);
+                    if let MirStmt::Assign { value: MirRvalue::Phi { values }, .. }
+                        = &mut self.blocks[info.header_block].stmts[info.stmt_index]
+                    {
+                        values.push((continue_block, MirOperand::Move(MirPlace::Ssa(ssa))));
+                    }
+                }
+
+                self.set_terminator(MirTerminator::Goto(loop_ctx.continue_target));
                 Ok(Diverging::Diverged)
             }
             HirStmt::For { .. } => {
@@ -1070,6 +1195,33 @@ impl MirBuilder {
                 Ok(Diverging::Value(MirRvalue::ArrayLiteral(mir_elements)))
             }
             HirExprKind::LackSlice(_ty) => Ok(Diverging::Value(MirRvalue::ArrayLiteral(Vec::new()))),
+            // ===== 新增：取地址 &x / &mut x =====
+            // 关键说明：这不是"求值一个表达式拿到操作数"，而是"求出
+            // expr 指的是哪个位置"——跟 build_place 是同一件事，所以
+            // 直接委托给它，不走 build_expr。expr 本身也可能发散
+            // （比如 `&panic()`，虽然这种写法几乎不会真的有人写，但
+            // 结构上仍然可能），照旧用 propagated 传播。
+            HirExprKind::Ref { mutable, expr: inner } => {
+                let place = match propagated(self.build_place(inner, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
+                Ok(Diverging::Value(MirRvalue::Ref { mutable: *mutable, place }))
+            }
+            // ===== 新增：解引用 *p =====
+            // 关键说明：`*p` 用在"求值"位置时（不是赋值目标），语义是
+            // "读 p 指向的那个位置的值"——先求出 p 指向哪个位置
+            // （build_place 会把 Deref 包一层 MirPlace::Deref），再用
+            // Move 包起来交给 MirRvalue::Use，跟其他 FieldAccess/Index
+            // 读取是同一个套路（build_expr_rvalue 里 FieldAccess/Index
+            // 那条分支）。
+            HirExprKind::Deref(inner) => {
+                let place = match propagated(self.build_place(inner, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
+                Ok(Diverging::Value(MirRvalue::Use(MirOperand::Move(place))))
+            }
             HirExprKind::Block(b) => {
                 match self.build_block(b, shared)? {
                     Diverging::Diverged => Ok(Diverging::Diverged),
@@ -1936,6 +2088,13 @@ impl MirBuilder {
                 Self::collect_modified_vars_block(body, out);
             }
             HirStmt::Break { .. } => {}
+            // 关键新增：对应 hir.rs 新增的 HirStmt::Continue——continue
+            // 本身不修改任何变量（它只是跳转），但这只是"这条语句自己
+            // 有没有 Assign"这个问题的答案；HirStmt::Continue 分支
+            // 真正处理 continue 回边时（见 build_stmt 里那处），是靠
+            // 循环头已经插好的 Phi 信息去补 incoming，不依赖这里的
+            // 扫描结果——两者关注点不同，这里如实报告"没有"就够了。
+            HirStmt::Continue { .. } => {}
             HirStmt::Return { expr, .. } => {
                 if let Some(e) = expr {
                     Self::collect_modified_vars_expr(e, out);
@@ -1984,6 +2143,13 @@ impl MirBuilder {
                     Self::collect_modified_vars_expr(&arm.expr, out);
                 }
             }
+            // 关键新增：对应 hir.rs 新增的 Ref/Deref——`&x`/`*p` 内部
+            // 包着的仍然是一个 HirExpr（不是 HirBlock），跟 Unary/Cast
+            // 是同一类"纯包一层，不直接携带语句"的形状，本来可以归进
+            // 下面的穷尽列表；单独列出来只是为了在这条注释里点名它们
+            // 是这次新加的，而不是一直就在这里。
+            HirExprKind::Ref { .. } => {}
+            HirExprKind::Deref(_) => {}
             // 其余表达式种类本身不可能直接携带 HirStmt（它们的子节点
             // 要么是别的表达式，要么是纯数据如字符串/类型），因此不
             // 可能包含 Assign 语句，不需要递归。穷尽列出，不用 `_`

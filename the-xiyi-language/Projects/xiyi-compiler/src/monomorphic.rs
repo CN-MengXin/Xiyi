@@ -228,6 +228,9 @@ impl Monomorphic {
         MirProgram {
             structs: new_structs,
             enums: new_enums,
+            consts: program.consts,
+            protos: program.protos,
+            interfaces: program.interfaces,
             fns: new_fns,
             intrinsics_used: program.intrinsics_used,
         }

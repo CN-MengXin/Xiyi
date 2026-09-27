@@ -47,6 +47,18 @@ impl MirBuilder {
                 };
                 Ok(Diverging::Value(MirPlace::Index { base: Box::new(base_place), index: Box::new(index_operand) }))
             }
+            // 关键新增：对应 hir.rs 新增的 HirExprKind::Deref——`*p = 5;`
+            // 这种"通过解引用赋值"要求 `*p` 也能被当成一个赋值目标
+            // （MirPlace），不只是求值位置能用。跟 FieldAccess/Index 是
+            // 同一个套路：先求出 inner（`p`）指向哪个位置，再在外面包
+            // 一层 MirPlace::Deref。
+            HirExprKind::Deref(inner) => {
+                let base = match propagated(self.build_place(inner, shared)?) {
+                    Ok(v) => v,
+                    Err(()) => return Ok(Diverging::Diverged),
+                };
+                Ok(Diverging::Value(MirPlace::Deref(Box::new(base))))
+            }
             _ => Err(format!(
                 "internal error: {:?} is not a valid assignment target \
                  (sema.rs 的 is_assignable 应该已经拦住了这种情况，走到这里说明两边检查不一致)",

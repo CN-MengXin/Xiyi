@@ -17,6 +17,14 @@ use crate::intrinsic::IntrinsicFn;
 pub struct MirProgram {
     pub structs: Vec<MirStruct>,
     pub enums: Vec<MirEnum>,
+    // 关键新增：AST/HIR 一直都有 const/proto/interface 这三种顶层
+    // 声明（HirProgram.consts/protos/interfaces），但 MIR 这一层从
+    // 没接住过——build() 只处理了 models/fns/structs/enums，用户写的
+    // 顶层 const、proto、interface 会被静默丢弃，走到 codegen 那一步
+    // 就凭空消失了，不会报错，只是生成的 Rust 代码里缺了这些声明。
+    pub consts: Vec<MirConst>,
+    pub protos: Vec<MirProto>,
+    pub interfaces: Vec<MirInterface>,
     pub fns: Vec<MirFn>,
     // 保留：codegen 需要知道这次编译实际用到了哪些内建函数，才能决定
     // 要不要在生成的 Rust 里带上对应的运行时支持代码。
@@ -42,6 +50,50 @@ pub struct MirEnum {
     pub name: String,
     pub generic_params: Vec<HirGenericParam>,
     pub variants: Vec<(String, Option<Type>)>,
+}
+
+// 关键新增：对应 HirConst——顶层 `const NAME: T = expr;`。
+// 关键说明（跟 HirConst 不同的地方）：HirConst.value 是一整棵 HirExpr
+// （常量声明右边可以写任意常量表达式），但 MIR 层的三地址码原则要求
+// 右值必须是已经求好值的操作数，不能直接塞一棵表达式树。真正"把
+// HirConst.value 这棵表达式树求值/折叠成一个 MirOperand"这一步，
+// mir_builder.rs 目前还没做（build() 里先占位成 Unit，标了 TODO），
+// 这里的类型定义先把 MIR 层"顶层常量长什么样"这件事定下来。
+#[derive(Debug, Clone)]
+pub struct MirConst {
+    pub name: String,
+    pub ty: Type,
+    pub value: MirOperand,
+}
+
+// 关键新增：对应 HirProto——`proto Name { Variant(T), ... }`，Actor
+// 消息协议的编译期契约声明。落地成 Rust 就是一个普通 enum（见
+// codegen.rs 里对应的生成逻辑），variants 直接复用"变体名 + 可选
+// payload 类型"这个形状，跟 MirEnum.variants 是同一个结构，没必要
+// 另起一套。
+#[derive(Debug, Clone)]
+pub struct MirProto {
+    pub name: String,
+    pub variants: Vec<(String, Option<Type>)>,
+}
+
+// 关键新增：对应 HirFnSig——interface 里每个方法的签名（只有签名，
+// 没有函数体）。
+#[derive(Debug, Clone)]
+pub struct MirFnSig {
+    pub name: String,
+    pub generic_params: Vec<HirGenericParam>,
+    pub params: Vec<(String, Type)>,
+    pub return_type: Option<Type>,
+}
+
+// 关键新增：对应 HirInterface——`interface Name { fn method(...); }`，
+// 落地成 Rust 的 trait。
+#[derive(Debug, Clone)]
+pub struct MirInterface {
+    pub name: String,
+    pub generic_params: Vec<HirGenericParam>,
+    pub methods: Vec<MirFnSig>,
 }
 
 #[derive(Debug, Clone)]

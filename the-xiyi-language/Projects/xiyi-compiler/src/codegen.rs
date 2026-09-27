@@ -44,6 +44,69 @@ impl Codegen {
             code.push_str(&Self::gen_enum(e));
         }
 
+        // 关键新增：consts/protos/interfaces 之前在 codegen 这一层完全
+        // 没有对应的生成逻辑（哪怕 mir_builder.rs 真的把它们塞进了
+        // MirProgram，走到这里也没人读）。跟 struct/enum 一样，在函数
+        // 生成之前先把这三类顶层声明落成 Rust 代码。
+        //
+        // consts：MirConst.value 是 MirOperand，渲染需要 CodegenContext
+        // ——顶层常量不属于任何函数体，没有真正的局部变量表，这里给一个
+        // 空 ctx 占位。只要 mir_builder.rs 那边 const 的值还只折叠成
+        // Constant（目前唯一的占位实现），空 ctx 完全够用；等真正实现
+        // 常量表达式折叠后，如果值仍然只可能是 Constant/Static/Sym 这几
+        // 种不依赖局部变量的操作数，空 ctx 依然正确。
+        let empty_ctx = CodegenContext {
+            locals: HashMap::new(),
+            enum_variants: HashMap::new(),
+            enum_variant_has_payload: HashMap::new(),
+        };
+        for c in &program.consts {
+            code.push_str(&format!(
+                "const {}: {} = {};\n",
+                c.name,
+                Self::type_to_rust(&c.ty),
+                Self::operand_to_string(&c.value, &empty_ctx),
+            ));
+        }
+        if !program.consts.is_empty() {
+            code.push('\n');
+        }
+
+        // protos → Rust enum。跟 gen_enum 长得像但不复用它：MirProto
+        // 的 variants 形状虽然和 MirEnum 一样（名字 + 可选 payload
+        // 类型），但 proto 目前不需要 gen_enum 里那些泛型参数/派生
+        // 之外的额外处理，直接手写更直接，等两者需求真的趋同了再考虑
+        // 合并。
+        for p in &program.protos {
+            let mut proto_code = format!("#[derive(Debug, Clone)]\nenum {} {{\n", p.name);
+            for (name, ty) in &p.variants {
+                match ty {
+                    Some(t) => proto_code.push_str(&format!("    {}({}),\n", name, Self::type_to_rust(t))),
+                    None => proto_code.push_str(&format!("    {},\n", name)),
+                }
+            }
+            proto_code.push_str("}\n\n");
+            code.push_str(&proto_code);
+        }
+
+        // interfaces → Rust trait。只生成方法签名（interface 本身就
+        // 只有签名，没有函数体——真正的实现在 implement 块里，走的是
+        // 已有的 impls → fns 那条路径，这里不重复生成）。
+        for i in &program.interfaces {
+            let mut trait_code = format!("trait {} {{\n", i.name);
+            for m in &i.methods {
+                let params: Vec<String> = m.params.iter()
+                    .map(|(n, t)| format!("{}: {}", n, Self::type_to_rust(t)))
+                    .collect();
+                let ret = m.return_type.as_ref()
+                    .map(|t| format!(" -> {}", Self::type_to_rust(t)))
+                    .unwrap_or_default();
+                trait_code.push_str(&format!("    fn {}({}){};\n", m.name, params.join(", "), ret));
+            }
+            trait_code.push_str("}\n\n");
+            code.push_str(&trait_code);
+        }
+
         let enum_variants: HashMap<String, Vec<String>> = program.enums
             .iter()
         .map(|e| {

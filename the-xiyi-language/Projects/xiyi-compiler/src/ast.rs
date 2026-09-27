@@ -198,6 +198,9 @@ pub struct LoopStmt {
 pub struct BreakStmt {}
 
 #[derive(Debug, PartialEq, Clone)]
+pub struct ContinueStmt {}
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct MatchExpr {
     pub cond: Box<Expr>,
     pub arms: Vec<MatchArm>,
@@ -265,6 +268,12 @@ pub enum Stmt {
     Assign(AssignStmt),
     Loop(LoopStmt),
     Break(BreakStmt),
+    // 关键新增：语言里一直没有 continue 关键字对应的语句节点——
+    // parser.rs 大概率也从来没接过这个语法（这次不碰 parser.rs，只
+    // 把 AST/HIR 层的坑填上；语法真正接上、sema 检查"continue 只能
+    // 出现在循环内"，是后续的事）。空结构体，跟 BreakStmt 是同一个
+    // 设计：语句本身不携带任何数据，只是一个"跳到循环头"的标记。
+    Continue(ContinueStmt),
     UnsafeBlock(UnsafeBlockStmt),
 }
 
@@ -325,12 +334,19 @@ pub enum ExprKind {
         // Some("Rational") = 静态限定调用，不是枚举变体构造、也不是方法调用
         qualifier: Option<String>,
         func: String,
+        // 关键新增：显式泛型实参，支持 `identity::<i32>(1)` 这种写法。
+        // sema 真正实现泛型替换之前，允许是空 Vec（不写 `::<...>` 的
+        // 普通调用），先占位、不阻塞现有调用点。
+        generic_args: Vec<Type>,
         args: Vec<CallArg>,
         is_method: bool,
     },
     Block(Block),
     StructInit {
         struct_name: String,
+        // 关键新增：同 Call，支持 `Box::<i32> { value: 1 }` 这种显式
+        // 实例化写法。
+        generic_args: Vec<Type>,
         fields: Vec<(String, Expr)>,
     },
     FieldAccess {
@@ -347,6 +363,8 @@ pub enum ExprKind {
     },
     EnumVariantConstruction {
         enum_name: String,
+        // 关键新增：同 Call/StructInit。
+        generic_args: Vec<Type>,
         variant_name: String,
         args: Vec<CallArg>,
     },
@@ -388,6 +406,20 @@ pub enum ExprKind {
     // T 必须是具体类型（禁止泛型参数/never/impl Trait，这条约束交给
     // sema 检查），这里直接存 Type，不需要额外包一层结构。
     LackSlice(Type),
+    // ===== 新增：取地址 &x / &mut x，对应语言里的显式借用 =====
+    // 关键设计：不塞进 UnaryOp——UnaryOp 是纯符号、#[derive(Copy)]，
+    // `&mut` 还要带一个 mutable: bool（是否可变借用），跟 UnaryOp
+    // "只是个符号，没有附加数据"的定位不一致，硬塞进去要么得给 UnaryOp
+    // 也加一个 bool 字段（污染 Neg/Not 这些完全不需要它的变体），要么
+    // 得再拆一个 Ref/RefMut 两个变体（又不如直接一个字段直观）。单独
+    // 开一个 ExprKind 变体，跟 ast::Type::Ref { mutable, .. }（类型
+    // 层面的引用类型）在设计上对应起来，读起来也更直接。
+    Ref {
+        mutable: bool,
+        expr: Box<Expr>,
+    },
+    // ===== 新增：解引用 *p =====
+    Deref(Box<Expr>),
 }
 
 // ===== 一元运算符 =====
