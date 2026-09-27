@@ -53,9 +53,16 @@ impl TypeChecker {
     // 函数调用结果、二元运算结果这些都不行。目前允许的范围跟标准库
     // 实际用到的写法（i = ...、self.len = ...、arr[i] = ...）对齐，以后
     // 真要支持解引用赋值（*ptr = ...）再回来加 Unary 那个分支。
+    // 关键新增：*p = 5 这种"通过解引用赋值"现在也是合法写法
+    // （ast.rs 新增了 ExprKind::Deref，guide.rs 的 build_place 也已经
+    // 接住了这个变体），漏掉 Deref 会导致这类赋值在语义检查这一步就被
+    // "只能对变量、字段、索引赋值"拦下来，压根走不到 MIR 构建那一步。
     pub fn is_assignable(&self, expr: &Expr) -> bool {
         match expr.kind {
-            ExprKind::Ident(_) | ExprKind::FieldAccess { .. } | ExprKind::Index { .. } => true,
+            ExprKind::Ident(_)
+            | ExprKind::FieldAccess { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::Deref(_) => true,
             _ => false,
         }
     }

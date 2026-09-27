@@ -40,8 +40,9 @@ impl TypeChecker {
                         return Err("pattern enum name mismatch".to_string());
                     }
                     // 合并原来"contains 检查 + find 取值"两次查找为一次——
-                    // 原来那次 contains 通过之后，find 必然成功，`ok_or_else(||
-                    // "variant not found")` 是永远不会走到的死代码。
+                    // 原来那次 contains 通过之后，find 必然成功，
+                    // `ok_or_else(|| "variant not found")` 是永远不会走到
+                    // 的死代码。
                     let variant = self.resolve_variant_in(&enum_name, variant_name)
                         .ok_or_else(|| format!("enum {} has no variant {}", enum_name, variant_name))?;
 

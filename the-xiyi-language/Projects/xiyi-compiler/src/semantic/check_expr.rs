@@ -108,10 +108,18 @@ impl TypeChecker {
     // 这次构造的参数里（`Result<T, E>` 构造 `Ok(1)` 时，参数只能推出 T，
     // E 单靠参数永远推不出来），也能借助标注拿到值。这不是完整的双向类型
     // 推导，只处理"构造表达式外面刚好套了一层显式标注"这一种情况，够用。
+    //
+    // 新增的 `generic_args` 参数：对应 `Result::Ok::<i32, ()>(1)` 这种
+    // 显式写出的泛型实参，在 preset_bindings_from_expected（来自外部
+    // 期望类型的推导）之前先绑定——用户显式写的实参本来就该比"从上下文
+    // 反推"更优先生效，bind_generic_args 内部直接把绑定塞进同一张
+    // bindings 表，后面 unify_type 遇到重复的名字会去校验一致性，不会
+    // 让期望类型的推导结果覆盖用户写死的值。
     pub fn check_enum_variant_construction(
         &mut self,
         enum_name: &str,
         variant_name: &str,
+        generic_args: &[Type],
         args: &[CallArg],
         expected: Option<&Type>,
     ) -> Result<Type, String> {
@@ -133,7 +141,9 @@ impl TypeChecker {
             // 注册进去的函数表），当成限定路径的静态调用检查。两边都
             // 查不到才真正报错。
             if self.has_qualified_static(enum_name, variant_name) {
-                return self.check_qualified_static_call(enum_name, variant_name, args, expected);
+                return self.check_qualified_static_call(
+                    enum_name, variant_name, generic_args, args, expected,
+                );
             }
             return Err(format!("undefined enum: {}", enum_name));
         };
@@ -145,7 +155,8 @@ impl TypeChecker {
 
         let mut bindings: HashMap<String, Type> = HashMap::new();
 
-        // 关键新增：预置来自外部期望类型的绑定
+        // 关键新增：先绑定显式泛型实参，再用期望类型补全剩下没写的部分。
+        Self::bind_generic_args(&enum_def.generic_params, generic_args, &mut bindings)?;
         Self::preset_bindings_from_expected(expected, enum_name, &enum_def.generic_params, &mut bindings);
 
         if let Some(expected_ty) = &variant.ty {
@@ -201,9 +212,13 @@ impl TypeChecker {
     }
 
     // ===== StructInit 的检查逻辑，独立成方法，同样的 expected 提示套路 =====
+    // 新增的 `generic_args` 参数同 check_enum_variant_construction：
+    // `Box::<i32> { value: 1 }` 这种显式实例化写法，在字段推导（下面
+    // 逐个字段 unify）和期望类型推导之前先绑定。
     pub fn check_struct_init(
         &mut self,
         struct_name: &str,
+        generic_args: &[Type],
         fields: &[(String, Expr)],
         expected: Option<&Type>,
     ) -> Result<Type, String> {
@@ -222,6 +237,7 @@ impl TypeChecker {
         }
         let mut bindings: HashMap<String, Type> = HashMap::new();
 
+        Self::bind_generic_args(&struct_def.generic_params, generic_args, &mut bindings)?;
         Self::preset_bindings_from_expected(expected, struct_name, &struct_def.generic_params, &mut bindings);
 
         // 关键修复：以前只检查了"字段个数对不对"，没检查"有没有同一个
@@ -307,9 +323,19 @@ impl TypeChecker {
 
     // ===== 辅助：从外部期望类型里预置泛型绑定 =====
     // check_struct_init 和 check_enum_variant_construction 各自内联了
-    // 一份一模一样的"期望类型如果是 Type::Generic 且名字/元数对得上，
-    // 就按位置把泛型参数名跟期望类型里的实参预先绑好"逻辑，抽成一个
-    // 共享函数。
+    // 一份一模一样的"期望类型如果是 Type::Generic 且名字对得上，就按
+    // 位置把泛型参数名跟期望类型里的实参预先绑好"逻辑，抽成一个共享
+    // 函数。
+    //
+    // 关键修复：现在复用 bind_generic_args 而不是自己再写一遍"按位置
+    // zip 绑定"——原来这里手写的版本额外要求 `exp_args.len() ==
+    // generic_params.len()` 才绑定，数量不对就整个跳过、什么都不绑；
+    // bind_generic_args 内部会在数量不对时返回 Err，这里用 `let _ =`
+    // 忽略这个错误（期望类型只是"尽力而为"的提示，数量对不上大概率是
+    // 期望类型本身就没打算描述这个构造——比如外层还嵌套了别的泛型——
+    // 不是真正需要在这一步报出来的错误，真正的类型不匹配交给后面
+    // 逐个参数/字段 unify 时自然暴露），效果与原来"跳过"一致，只是
+    // 不必再单独维护一份长度校验。
     fn preset_bindings_from_expected(
         expected: Option<&Type>,
         name: &str,
@@ -317,11 +343,8 @@ impl TypeChecker {
         bindings: &mut HashMap<String, Type>,
     ) {
         if let Some(Type::Generic(exp_name, exp_args)) = expected {
-            if exp_name == name && exp_args.len() == generic_params.len() {
-                let generic_names = Self::generic_param_names(generic_params);
-                for (n, ty) in generic_names.iter().zip(exp_args.iter()) {
-                    bindings.insert(n.clone(), ty.clone());
-                }
+            if exp_name == name {
+                let _ = Self::bind_generic_args(generic_params, exp_args, bindings);
             }
         }
     }
@@ -333,11 +356,15 @@ impl TypeChecker {
     // 行为不变。调用方目前只有 Stmt::Let（当有显式类型标注时）。
     pub fn check_expr_with_expected(&mut self, expr: &Expr, expected: Option<&Type>) -> Result<Type, String> {
         match (&expr.kind, expected) {
-            (ExprKind::EnumVariantConstruction { enum_name, variant_name, args }, Some(expected_ty)) => {
-                self.check_enum_variant_construction(enum_name, variant_name, args, Some(expected_ty))
+            (ExprKind::EnumVariantConstruction {
+                enum_name, variant_name, generic_args, args,
+            }, Some(expected_ty)) => {
+                self.check_enum_variant_construction(
+                    enum_name, variant_name, generic_args, args, Some(expected_ty),
+                )
             }
-            (ExprKind::StructInit { struct_name, fields }, Some(expected_ty)) => {
-                self.check_struct_init(struct_name, fields, Some(expected_ty))
+            (ExprKind::StructInit { struct_name, generic_args, fields }, Some(expected_ty)) => {
+                self.check_struct_init(struct_name, generic_args, fields, Some(expected_ty))
             }
             // 关键新增：裸 Ok(...)/Err(...)/Some(...)/None 这类写法（没有
             // Result::/Option:: 前缀）解析出来是 ExprKind::Call，不是
@@ -346,10 +373,18 @@ impl TypeChecker {
             // 完全走不到这个"带期望类型"的分支，泛型参数（比如
             // Result<Rational, E> 里的 E）就留在没绑定的状态，跟声明的
             // 返回类型（比如 Result<Rational, ()>）对不上。
-            (ExprKind::Call { qualifier: None, func, args, is_method: false }, Some(expected_ty)) => {
+            //
+            // 关键修复（本轮）：改用 resolve_bare_variant + generic_args
+            // 透传——原来这里内联的 `bare_matches` 过滤逻辑跟 check_path.rs
+            // 的 resolve_bare_variant 是同一件事的两份实现，现在统一走
+            // 一处；`func` 上如果写了 `::<...>`，也要跟着传下去，不能因为
+            // 走的是"裸变体"这条路径就把它丢在原地不用。
+            (ExprKind::Call { qualifier: None, func, generic_args, args, is_method: false }, Some(expected_ty)) => {
                 match self.resolve_bare_variant(func) {
                     BareVariantOutcome::Unique(enum_name) => {
-                        self.check_enum_variant_construction(&enum_name, func, args, Some(expected_ty))
+                        self.check_enum_variant_construction(
+                            &enum_name, func, generic_args, args, Some(expected_ty),
+                        )
                     }
                     BareVariantOutcome::Ambiguous(_) | BareVariantOutcome::NotFound => {
                         self.check_expr(expr)
@@ -618,9 +653,35 @@ impl TypeChecker {
                     inner: Box::new(Type::Slice(Box::new(elem_ty.clone()))),
                 })
             }
+            // ===== 取地址 &x / &mut x =====
+            // 关键新增：ast.rs 新增的 ExprKind::Ref，之前这里完全没有
+            // 对应分支——ExprKind 现在有 22 个变体，这里之前只列了 20
+            // 个，加上下面的 Deref 正好补齐，消除 E0004 非穷尽匹配。
+            // 结果类型直接照抄 mutable 标记，包一层 Type::Ref，跟
+            // guide.rs::build_place 处理 HirExprKind::Ref 时的"直接
+            // 透传 mutable"是同一个思路。
+            ExprKind::Ref { mutable, expr } => {
+                let inner_ty = self.check_expr(expr)?;
+                Ok(Type::Ref { mutable: *mutable, inner: Box::new(inner_ty) })
+            }
+            // ===== 解引用 *p =====
+            // 关键新增：同 Ref。`*p` 要求 p 本身是引用类型，剥掉一层
+            // Type::Ref 拿到里面的类型；对非引用类型解引用是类型错误，
+            // 直接报出来，不悄悄放行。这里先 strip_privacy 再匹配——
+            // 引用类型本身理论上不会被打隐私标签（隐私标签打在被引用的
+            // 值上），但跟 check_expr 其它分支的处理方式保持一致，防止
+            // 万一。
+            ExprKind::Deref(expr) => {
+                let inner_ty = self.check_expr(expr)?;
+                match self.strip_privacy(&inner_ty) {
+                    Type::Ref { inner, .. } => Ok(*inner),
+                    other => Err(format!("cannot dereference non-reference type: {:?}", other)),
+                }
+            }
             ExprKind::Call {
                 qualifier,
                 func,
+                generic_args,
                 args,
                 is_method,
             } => {
@@ -628,9 +689,11 @@ impl TypeChecker {
                 // 限定路径调用（目前 parser.rs 实际上还是把 `Type::func(...)`
                 // 统一走 EnumVariantConstruction 那条路，check_enum_variant_construction
                 // 里已经加了同样的兜底——这里加上是为了不管以后 parser 从哪条
-                // 路产出 qualifier: Some(_)，sema 都认得，不用再改一遍。
+                // 路产出 qualifier: Some(_)，sema 都认得，不用再改一遍）。
+                // generic_args 原样透传给限定静态调用，`Rational::gcd::<...>`
+                // 这种写法（如果语法上支持）也能走到同一套校验。
                 if let Some(q) = qualifier {
-                    return self.check_qualified_static_call(q, func, args, None);
+                    return self.check_qualified_static_call(q, func, generic_args, args, None);
                 }
 
                 // 关键新增：裸 Ok(...)/Err(...)/Some(...)/None 这类写法——
@@ -638,15 +701,15 @@ impl TypeChecker {
                 // Call（qualifier: None），不是 EnumVariantConstruction。
                 // 语言规范里这些写法就是不加前缀直接用的（等同于 Rust 里
                 // Option::{Some,None}/Result::{Ok,Err} 被自动放进 prelude
-                // 作用域）。这里不是专门为 Ok/Err/Some/None 硬编码四个名字，
-                // 而是通用规则：在所有已注册的枚举里找"哪个枚举有一个恰好
-                // 叫这个名字的变体"，找到且唯一就当枚举变体构造处理；同一个
-                // 名字被多个枚举用作变体名时（真撞了）就报错让用户写限定
-                // 路径消歧义，不去猜。
+                // 作用域）。改用 check_path.rs 的 resolve_bare_variant——
+                // 跟 check_expr_with_expected 那边共用同一份"哪个枚举有
+                // 这个变体名"的判断，不再各自维护一份内联遍历。
                 if !is_method {
                     match self.resolve_bare_variant(func) {
                         BareVariantOutcome::Unique(enum_name) => {
-                            return self.check_enum_variant_construction(&enum_name, func, args, None);
+                            return self.check_enum_variant_construction(
+                                &enum_name, func, generic_args, args, None,
+                            );
                         }
                         BareVariantOutcome::Ambiguous(candidates) => {
                             return Err(format!(
@@ -685,18 +748,20 @@ impl TypeChecker {
                 // check_tensor_dynamic_call，不进 intrinsic.rs 的纯函数
                 // check_intrinsic_call。
                 //
+                // 关键新增：generic_args 原样透传给两条内建路径——内建
+                // 函数没有一个声明泛型参数，但用户写 `print::<i32>("x")`
+                // 在语法上合法，不能因为走的是内建分支就悄悄把它丢掉，
+                // 必须让 intrinsic.rs 的 check_no_generic_args 接住并报错。
+                //
                 // 这里把内建函数识别放在"跨 model 调用/递归检查/用户
                 // 函数表查找"之前——内建函数名字（linear/conv2d/...）
                 // 现在当成真正的保留字对待，用户不能定义一个同名函数
-                // 悄悄把内建实现顶替掉（之前 print/panic/from_utf8_unchecked
-                // 三个是这个优先级，但 linear/conv2d 等张量算子却排在
-                // 用户函数表查找之后，同一份代码里两种优先级并存，是
-                // 不必要的不一致）。
+                // 悄悄把内建实现顶替掉。
                 if let Some(name) = IntrinsicFn::from_str(func) {
                     if intrinsic::is_dynamic_intrinsic(name) {
-                        return self.check_tensor_dynamic_call(name, args);
+                        return self.check_tensor_dynamic_call(name, generic_args, args);
                     }
-                    return self.check_static_intrinsic_call(name, func, args);
+                    return self.check_static_intrinsic_call(name, func, generic_args, args);
                 }
 
                 // ===== 以下逻辑原样保留，只是位置往后挪了一段（原来夹在
@@ -737,7 +802,13 @@ impl TypeChecker {
                         // `fn pair<T>(a: T, b: T)` 这种多处用到同一个 T 的
                         // 场景绑定一致（不能用 types_equal 死板比较，那样
                         // `id(42)` 拿 I32 去跟声明里的 T 比较永远不相等）。
+                        //
+                        // 关键新增：显式泛型实参（`identity::<i32>(1)`）
+                        // 先绑进同一张表——用户写死的值应当先于参数推导
+                        // 生效，后面 unify_type 遇到已绑定的名字仍会校验
+                        // 一致性，不会被参数推导悄悄覆盖。
                         let mut bindings: HashMap<String, Type> = HashMap::new();
+                        Self::bind_generic_args(&fn_def.generic_params, generic_args, &mut bindings)?;
                         for (param, arg) in fn_params.iter().zip(args) {
                             let arg_ty = self.check_call_arg(arg)?;
                             if !self.unify_type(&arg_ty, &param.ty, &mut bindings) {
@@ -761,9 +832,9 @@ impl TypeChecker {
                 // 方法调用：查方法表（builtin 内建方法表 + self.methods 里
                 // implement 块登记的方法），按方法自己的签名（含泛型）检查。
                 // 逻辑挪到了 lookup.rs 的 check_method_call 里，这里只是
-                // 委托调用。
+                // 委托调用，generic_args 原样透传。
                 if *is_method {
-                    return self.check_method_call(func, args);
+                    return self.check_method_call(func, generic_args, args);
                 }
 
                 // 关键修复：原来这里在报兜底错误之前，又用
@@ -780,8 +851,8 @@ impl TypeChecker {
                 Err(format!("undefined function or method: {}", func))
             }
             ExprKind::Block(block) => self.check_block(block),
-            ExprKind::StructInit { struct_name, fields } => {
-                self.check_struct_init(struct_name, fields, None)
+            ExprKind::StructInit { struct_name, generic_args, fields } => {
+                self.check_struct_init(struct_name, generic_args, fields, None)
             }
             ExprKind::FieldAccess { struct_expr, field_name } => {
                 let struct_ty = self.check_expr(struct_expr)?;
@@ -979,9 +1050,10 @@ impl TypeChecker {
                 Ok(Type::Enum(enum_name.clone()))
             }
             // ---- EnumVariantConstruction：委托给 check_enum_variant_construction，
-            // expected 传 None，即"没有外部期望类型提示"这个默认情况。
-            ExprKind::EnumVariantConstruction { enum_name, variant_name, args } => {
-                self.check_enum_variant_construction(enum_name, variant_name, args, None)
+            // expected 传 None，即"没有外部期望类型提示"这个默认情况；
+            // generic_args 原样透传。
+            ExprKind::EnumVariantConstruction { enum_name, variant_name, generic_args, args } => {
+                self.check_enum_variant_construction(enum_name, variant_name, generic_args, args, None)
             }
             // ---- Match：模式检查挪到了 check_pattern.rs 的 check_match_expr 里，
             // 这里只是委托调用。
@@ -1003,10 +1075,15 @@ impl TypeChecker {
     }
 
     // ===== 静态内建函数：算好参数类型后交给 intrinsic.rs 的纯函数 =====
+    // 关键新增：generic_args 参数——内建函数没有一个声明泛型参数，这里
+    // 原样透传给 intrinsic::check_intrinsic_call，由它统一调用
+    // check_no_generic_args 校验"用户是不是写了 `::<...>`"，不在这里
+    // 单独判断。
     fn check_static_intrinsic_call(
         &mut self,
         name: IntrinsicFn,
         func: &str,
+        generic_args: &[Type],
         args: &[CallArg],
     ) -> Result<Type, String> {
         let arg_types: Vec<Type> = args
@@ -1032,7 +1109,7 @@ impl TypeChecker {
         }
 
         let ctx = CallCtx { args, arg_types: &arg_types };
-        match intrinsic::check_intrinsic_call(name, &ctx)? {
+        match intrinsic::check_intrinsic_call(name, generic_args, &ctx)? {
             CheckedResult::Plain(ty) => Ok(ty),
             CheckedResult::Receiver(base_ty) => {
                 let tag = self.extract_privacy_tag(&arg_types[0]);
@@ -1042,7 +1119,17 @@ impl TypeChecker {
     }
 
     // ===== 动态内建函数：闭包参数需要拿接收者类型当上下文递归检查 =====
-    fn check_tensor_dynamic_call(&mut self, name: IntrinsicFn, args: &[CallArg]) -> Result<Type, String> {
+    // 关键新增：generic_args 同样原样透传——tensor.cond/tensor.while_loop
+    // 也不接受显式泛型实参，用 intrinsic::check_no_generic_args 统一校验，
+    // 跟静态内建函数那条路径共用同一个检查函数，不在这里另写一份。
+    fn check_tensor_dynamic_call(
+        &mut self,
+        name: IntrinsicFn,
+        generic_args: &[Type],
+        args: &[CallArg],
+    ) -> Result<Type, String> {
+        intrinsic::check_no_generic_args(name, generic_args)?;
+
         match name {
             IntrinsicFn::TensorCond => {
                 let tc = intrinsic::extract_tensor_cond_args(args)?;

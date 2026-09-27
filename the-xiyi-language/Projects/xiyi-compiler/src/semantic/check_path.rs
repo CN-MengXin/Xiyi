@@ -57,16 +57,6 @@ impl TypeChecker {
 
     /// 从 `Type` 里解析出正确的具名类型：`Type::Struct(name)` 实际是
     /// enum 时改写成 `Type::Enum(name)`，反之亦然。其它变体原样返回。
-    ///
-    /// 之所以需要"身份纠正"：parser 只看 `Token::Ident` 就产出
-    /// `Type::Struct(name)`，从不产出 `Type::Enum`——enum 的身份必须由
-    /// sema 反查符号表确定。反过来，如果有别处（未来）手工构造
-    /// `Type::Enum` 但名字其实是 struct，也应该纠正回 `Type::Struct`，
-    /// 两个方向对称处理。
-    ///
-    /// 这里**不调 `resolve_type_name`**：那个函数在 `Struct` 分支会
-    /// 克隆整个 `StructDef`，而这里只需要知道"是不是 struct"这一个
-    /// 事实——直接查两张表的 key，避免无谓克隆。
     pub fn resolve_type(&self, ty: &Type) -> Result<Type, String> {
         match ty {
             Type::Struct(name) => {
@@ -91,16 +81,10 @@ impl TypeChecker {
         }
     }
 
-    /// 解析出一个 `StructDef`。需要遍历字段的调用点（字段访问、结构体
-    /// 初始化）用这个。
+    /// 解析出一个 `StructDef`。
     /// - 是 struct：返回定义；
     /// - 是 enum：报错 `"`X` is an enum, not a struct"`；
     /// - 都不是：报错 `"undefined struct: X"`。
-    ///
-    /// 三个调用点（`check_struct_init`、`FieldAccess` 的 `Struct` 与
-    /// `Generic` 分支）共用这一段"查定义 + 身份纠正 + 报错"逻辑；
-    /// 抽出来的价值不只是省几行，更是让"字段访问遇到 enum 该报什么错"
-    /// 只有一处维护。
     pub fn resolve_struct(&self, name: &str) -> Result<StructDef, String> {
         if let Some(s) = self.structs.get(name) {
             Ok(s.clone())
@@ -113,13 +97,9 @@ impl TypeChecker {
 
     // ===== 限定路径 =====
 
-    /// `EnumName::Variant`——查变体定义，返回 owned。
-    /// 只区分"找到/没找到"，不区分"枚举不存在"和"枚举存在但没这个
-    /// 变体"；调用点自己按上下文拼错误信息（它们本来就要拼不同的错误）。
-    ///
-    /// 只用在**需要拿到 `EnumVariant` 定义**的调用点（`check_pattern.rs`
-    /// 的 `EnumVariantWithBinding` 分支——要拿 `variant.ty` 推绑定类型）。
-    /// 只需要布尔结果的调用点用下面的 `has_variant`，避免白克隆。
+    /// `EnumName::Variant`——查变体定义，返回 owned。只用在**需要拿到
+    /// `EnumVariant` 定义**的调用点；只需要布尔结果的调用点用
+    /// `has_variant`，避免白克隆。
     pub fn resolve_variant_in(
         &self,
         enum_name: &str,
@@ -134,8 +114,6 @@ impl TypeChecker {
     }
 
     /// 只判断"枚举 X 有没有变体 Y"，不克隆 `EnumVariant`。
-    /// 用于只需要"存不存在"的调用点（`check_pattern.rs` 的
-    /// `EnumVariant` 分支、`check_expr.rs` 的 `EnumVariantAccess` 分支）。
     pub fn has_variant(&self, enum_name: &str, variant_name: &str) -> bool {
         self.enums
             .get(enum_name)
@@ -153,10 +131,6 @@ impl TypeChecker {
 
     /// 在所有已注册的枚举里找"哪个恰好有这个名字的变体"。
     /// 找不到 → `NotFound`；恰好一个 → `Unique`；多个 → `Ambiguous`。
-    ///
-    /// `Ambiguous` 里的候选列表按名字排序：原来两处内联遍历的
-    /// `matches.join(", ")` 顺序来自 `HashMap` 迭代，不稳定；排序之后
-    /// 错误信息确定，测试也更好写。
     pub fn resolve_bare_variant(&self, name: &str) -> BareVariantOutcome {
         let matches: Vec<&str> = self
             .enums
