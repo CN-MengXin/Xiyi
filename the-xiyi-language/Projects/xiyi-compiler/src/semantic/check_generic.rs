@@ -15,6 +15,45 @@ impl TypeChecker {
             .collect()
     }
 
+    // ===== 把显式写出的泛型实参（`identity::<i32>(1)` 里的 `<i32>`）
+    // 预先绑进 bindings =====
+    //
+    // 以前"预置 bindings"这件事散落在四个地方各自实现（
+    // check_qualified_static_call 用 expected 反推、
+    // check_enum_variant_construction/check_struct_init 用
+    // preset_bindings_from_expected、普通函数调用内联 unify），现在
+    // ExprKind::Call/StructInit/EnumVariantConstruction 都带上了
+    // generic_args 字段，是第五个要塞进同一张表的来源。这里统一成
+    // 一个函数：没写显式泛型实参（generic_args 为空，`identity(1)`
+    // 这种普通调用）直接放行，写了就要求数量对得上声明的泛型参数
+    // 个数，一一按声明顺序绑定。
+    //
+    // 之所以放行"空 Vec"而不是要求个数一定相等：语言目前允许完全不写
+    // `::<...>`（数量为 0）走类型推导那条老路，只有用户确实写了
+    // `::<...>` 才需要校验数量——这跟"写了泛型实参但数量不对"是两种
+    // 不同的错误，不能混为一谈。
+    pub fn bind_generic_args(
+        generic_params: &[GenericParam],
+        generic_args: &[Type],
+        bindings: &mut HashMap<String, Type>,
+    ) -> Result<(), String> {
+        if generic_args.is_empty() {
+            return Ok(());
+        }
+        let names = Self::generic_param_names(generic_params);
+        if names.len() != generic_args.len() {
+            return Err(format!(
+                "expected {} generic argument(s), got {}",
+                names.len(),
+                generic_args.len()
+            ));
+        }
+        for (name, ty) in names.iter().zip(generic_args.iter()) {
+            bindings.insert(name.clone(), ty.clone());
+        }
+        Ok(())
+    }
+
     // ===== 泛型实例化核心：合一（unify） =====
     //
     // expected 是声明里写的类型（可能包含 Type::TypeParam），actual 是调用点/

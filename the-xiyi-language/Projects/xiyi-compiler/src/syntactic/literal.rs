@@ -14,7 +14,7 @@
 
 use crate::ast::*;
 use crate::token::Token;
-use super::module::Parser;
+use super::Parser;
 
 impl Parser {
     /// 尝试把当前 token 识别成一个字面量表达式（整数/浮点/字符串/
@@ -28,7 +28,26 @@ impl Parser {
         match peek_token {
             Some((Token::Integer, value)) => {
                 self.next();
-                let num = value.parse::<i64>().unwrap();
+                // 词法层只保证这串字符"看起来像整数"，不保证它塞得进
+                // i64（位数太多）或者塞得进 i32（值超出 Int32 能表示的
+                // 范围）。这两步都要显式检查，不能 unwrap——unwrap 失败
+                // 是直接 panic 掉整个编译器进程，而不是给用户一条
+                // "这个字面量太大了"的错误信息。
+                let num = match value.parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return Some(Err(format!(
+                            "Integer literal too large for any integer type: {}",
+                            value
+                        )));
+                    }
+                };
+                if num < i32::MIN as i64 || num > i32::MAX as i64 {
+                    return Some(Err(format!(
+                        "Integer literal {} out of range for Int32 ({}..={})",
+                        value, i32::MIN, i32::MAX
+                    )));
+                }
                 Some(Ok(Expr {
                     id: self.next_expr_id(),
                     kind: ExprKind::Literal(Literal::Int32(num as i32)),
@@ -36,7 +55,12 @@ impl Parser {
             }
             Some((Token::Float, value)) => {
                 self.next();
-                let num = value.parse::<f64>().unwrap();
+                let num = match value.parse::<f64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return Some(Err(format!("Invalid float literal: {}", value)));
+                    }
+                };
                 Some(Ok(Expr {
                     id: self.next_expr_id(),
                     kind: ExprKind::Literal(Literal::Float64(num)),
@@ -44,11 +68,7 @@ impl Parser {
             }
             Some((Token::String, value)) => {
                 self.next();
-                let inner = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-                    value[1..value.len()-1].to_string()
-                } else {
-                    value
-                };
+                let inner = Self::strip_quotes(value);
                 Some(Ok(Expr {
                     id: self.next_expr_id(),
                     kind: ExprKind::Literal(Literal::String(inner)),
@@ -70,11 +90,7 @@ impl Parser {
                         )));
                     }
                 };
-                let inner = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-                    value[1..value.len() - 1].to_string()
-                } else {
-                    value
-                };
+                let inner = Self::strip_quotes(value);
                 let bytes = match Self::decode_byte_string(&inner) {
                     Ok(b) => b,
                     Err(e) => return Some(Err(e)),
@@ -82,6 +98,36 @@ impl Parser {
                 Some(Ok(Expr {
                     id: self.next_expr_id(),
                     kind: ExprKind::Literal(Literal::ByteString(bytes)),
+                }))
+            }
+            // 关键新增：字符字面量 'a'。跟字符串字面量是同一套故事——
+            // Lexer 已经把 \n/\t/\xNN/\u{...} 这些转义序列解码成实际
+            // 字符了，这里只需要剥掉包裹用的单引号。空字符字面量 `''`
+            // （规范里明确非法，字符字面量不能为空）、剥完引号后不止
+            // 剩一个字符（正常不该出现，防御性检查）都如实报错，不
+            // 装作侥幸猜一个字符——这两种情况理论上应该在词法阶段就被
+            // 拦下（error[LEX003] 之类），但 parser 这层不应该假设
+            // Lexer 绝对不会把问题漏过来。
+            Some((Token::CharLit, value)) => {
+                self.next();
+                let inner = value
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .unwrap_or_else(|| value.as_str());
+                let mut chars = inner.chars();
+                let ch = match chars.next() {
+                    Some(c) => c,
+                    None => return Some(Err("empty char literal".to_string())),
+                };
+                if chars.next().is_some() {
+                    return Some(Err(format!(
+                        "char literal contains more than one character: {}",
+                        value
+                    )));
+                }
+                Some(Ok(Expr {
+                    id: self.next_expr_id(),
+                    kind: ExprKind::Literal(Literal::Char(ch)),
                 }))
             }
             Some((Token::True, _)) => {
@@ -117,6 +163,18 @@ impl Parser {
             }
         }
         None
+    }
+
+    // ===== 辅助：去掉字符串 token 两端的引号 =====
+    // 原来这段逻辑（判断长度 >=2 且首尾都是双引号，是就切片去头去尾，
+    // 不是就原样返回）在 parse_literal 里重复出现（普通字符串字面量、
+    // bytes"..." 里的字符串 token 各一次），改一次逻辑要跟着改好几处。
+    // 抽成一个函数，两处调用点都改成 `Self::strip_quotes(value)`。
+    fn strip_quotes(s: String) -> String {
+        s.strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .map(|s| s.to_string())
+            .unwrap_or(s)
     }
 
     // ===== 辅助：把 bytes"..." 里的原始文本解码成 Vec<u8> =====

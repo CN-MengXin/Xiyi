@@ -4,6 +4,34 @@ use crate::ast::*;
 use super::check_program::TypeChecker;
 
 impl TypeChecker {
+    // ===== "进入一层循环体、退出时恢复"的通用 combinator =====
+    // While/For/Loop 三处都要在检查 body 前把 loop_depth +1、检查完
+    // （不管成败）再 -1，跟 check_func.rs 的 with_current_return_type/
+    // with_isolated_scope 是同一个模式：不能直接在 `?` 前面写
+    // `self.loop_depth += 1; self.check_block(...)?; self.loop_depth -= 1;`——
+    // body 检查失败时 `?` 会直接跳出函数，-1 那行永远执行不到，
+    // loop_depth 会永久多算一层，后面同一次编译里所有 Break/Continue
+    // 的"是否在循环内"判断都会被这次失败悄悄污染。这里先把结果存起来，
+    // 再减一，最后才处理"要不要把错误往上抛"。
+    fn with_loop_depth<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.loop_depth += 1;
+        let result = f(self);
+        self.loop_depth -= 1;
+        result
+    }
+
+    // Break/Continue 共用的"是不是在循环里"检查，只在这一处拼错误
+    // 信息，两个关键字复用同一句话模板。
+    fn require_in_loop(&self, keyword: &str) -> Result<(), String> {
+        if self.loop_depth == 0 {
+            return Err(format!("`{}` outside of loop", keyword));
+        }
+        Ok(())
+    }
+
     pub fn check_stmt(&mut self, stmt: &Stmt) -> Result<Type, String> {
         match stmt {
             Stmt::Let(let_stmt) => {
@@ -23,27 +51,12 @@ impl TypeChecker {
                 let init_type = self.check_expr_with_expected(&let_stmt.init, let_stmt.ty.as_ref())?;
 
                 let resolved_ty = if let Some(ty) = &let_stmt.ty {
-                    match ty {
-                        Type::Struct(name) => {
-                            if self.structs.contains_key(name) {
-                                Type::Struct(name.clone())
-                            } else if self.enums.contains_key(name) {
-                                Type::Enum(name.clone())
-                            } else {
-                                return Err(format!("undefined type: {}", name));
-                            }
-                        }
-                        Type::Tensor { dtype, shape } => Type::Tensor {
-                            dtype: dtype.clone(),
-                            shape: shape.clone(),
-                        },
-                        other => other.clone(),
-                    }
+                    self.resolve_type(ty)?
                 } else {
                     init_type.clone()
                 };
 
-                if !self.types_equal(&init_type, &resolved_ty) {
+                if !self.types_equal_allowing_never(&init_type, &resolved_ty) {
                     return Err(format!("type mismatch: expected {:?}, got {:?}", resolved_ty, init_type));
                 }
 
@@ -97,7 +110,11 @@ impl TypeChecker {
                 if cond_ty != Type::Bool {
                     return Err("while condition must be bool".to_string());
                 }
-                self.check_block(&while_stmt.body)?;
+                // 关键新增：body 检查期间 loop_depth +1，好让 body 里的
+                // `break`/`continue` 能通过 require_in_loop 的检查——
+                // 用 with_loop_depth 而不是手写 +1/-1，退出时无论成败
+                // 都能正确恢复。
+                self.with_loop_depth(|s| s.check_block(&while_stmt.body))?;
                 // 同上：while 语句本身不产出值
                 Ok(Type::Unit)
             }
@@ -117,15 +134,31 @@ impl TypeChecker {
                         );
                     }
                 }
-                self.check_expr(&for_stmt.iterable)?;
+                // 关键修复：以前这里 self.check_expr(&for_stmt.iterable)?
+                // 的返回值被直接丢弃，只用来触发检查，循环变量类型硬
+                // 编码成 Type::I32。而 check_expr.rs 的 Range 分支自己
+                // 也硬编码返回 Type::I32，两处凑在一起，`0..100i64` 这种
+                // 写法迭代出来的循环变量被判成 I32，循环体里
+                // `let x: i64 = i;` 就会报类型不匹配——Range 那边现在
+                // 已经按两端类型正确返回 I32/I64（元素类型即 Range 表达式
+                // 本身的类型），这里改成直接拿这个结果当循环变量类型，
+                // 不再自己瞎猜一个 I32。
+                let elem_ty = self.check_expr(&for_stmt.iterable)?;
                 self.scopes.push(HashMap::new());
                 self.scopes
                     .last_mut()
                     .unwrap()
-                    .insert(for_stmt.var.clone(), Type::I32);
-                let body_type = self.check_block(&for_stmt.body)?;
+                    .insert(for_stmt.var.clone(), elem_ty);
+                // 关键新增：跟 While 一样，body 检查期间 loop_depth +1。
+                // 这里不能直接用 `?`——`self.scopes.pop()` 必须在
+                // body_result 算出来之后、不管成败都要执行（循环变量
+                // 的作用域是在 for_stmt.body 检查开始前 push 的，body
+                // 检查失败也不能让这个作用域永久留在 self.scopes 里，
+                // 污染后续的变量查找），所以先存住结果，pop 完再决定
+                // 要不要把错误往上抛。
+                let body_result = self.with_loop_depth(|s| s.check_block(&for_stmt.body));
                 self.scopes.pop();
-                Ok(body_type)
+                body_result
             }
             Stmt::Assign(assign_stmt) => {
                 // 关键修改：target 从裸变量名换成了任意表达式
@@ -137,7 +170,7 @@ impl TypeChecker {
                 // 自然由它们各自产生，不用在这里重复判断。
                 if !self.is_assignable(&assign_stmt.target) {
                     return Err(format!(
-                        "invalid assignment target: {:?}（只能对变量、字段、索引赋值）",
+                        "invalid assignment target: {:?}（只能对变量、字段、索引、解引用赋值）",
                         assign_stmt.target.kind
                     ));
                 }
@@ -146,7 +179,7 @@ impl TypeChecker {
                 // { self.cap * 2 };` 这类写法里的字面量分支，得靠这个才能
                 // 正确迁就 target 的真实类型（跟 let 那边是同一套机制）。
                 let expr_ty = self.check_expr_with_expected(&assign_stmt.expr, Some(&target_ty))?;
-                if !self.types_equal(&expr_ty, &target_ty) {
+                if !self.types_equal_allowing_never(&expr_ty, &target_ty) {
                     return Err(format!(
                         "type mismatch in assignment: expected {:?}, got {:?}",
                         target_ty, expr_ty
@@ -156,10 +189,23 @@ impl TypeChecker {
                 Ok(Type::Unit)
             }
             Stmt::Loop(loop_stmt) => {
-                let body_type = self.check_block(&loop_stmt.body)?;
-                Ok(body_type)
+                // 关键新增：同 While/For，loop 的 body 也算一层循环。
+                self.with_loop_depth(|s| s.check_block(&loop_stmt.body))
             }
-            Stmt::Break(_) => Ok(Type::Unit),
+            // 关键新增：以前 Break 完全不检查循环深度，`break;` 写在
+            // 函数顶层也能悄悄通过。现在先过 require_in_loop 这一关。
+            Stmt::Break(_) => {
+                self.require_in_loop("break")?;
+                Ok(Type::Unit)
+            }
+            // 关键新增：Stmt 现在有 10 个变体，Continue 是新加的第 10
+            // 个（ast.rs 里跟 Break 是同一个设计：空结构体，只是"跳到
+            // 循环头"的标记）。语义检查上跟 Break 一样，只是关键字不同、
+            // 不产出值也不提前退出循环——检查逻辑因此完全对称。
+            Stmt::Continue(_) => {
+                self.require_in_loop("continue")?;
+                Ok(Type::Unit)
+            }
             Stmt::UnsafeBlock(unsafe_stmt) => self.check_block(&unsafe_stmt.body),
         }
     }

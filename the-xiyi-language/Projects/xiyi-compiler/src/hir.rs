@@ -1,4 +1,4 @@
-use crate::ast::{Type, PrivacyTag, ShapeDim, Literal, Pattern, BinaryOp, UnsafeKind, UnaryOp, IfKind};
+use crate::ast::{Type, PrivacyTag, ShapeDim, Literal, Pattern, BinaryOp, UnsafeKind, UnaryOp, IfKind, WhereClause, Attribute};
 use std::collections::HashMap;
 
 #[derive(Debug, PartialEq, Clone, Default)]
@@ -71,15 +71,23 @@ pub struct HirGenericParam {
 // ===== HIR 表示 implement 块（补上 generic_params，对应 ast::ImplementDef 已有的字段）=====
 #[derive(Debug, Clone)]
 pub struct HirImplement {
+    // 关键新增：ast::ImplementDef 早就有 attributes/where_clause 这两个
+    // 字段（parser.rs 已经在填），HIR 这层一直没跟上，把它们丢在了
+    // build_implement 里——跟 generic_params 当年的坑是同一个模式。
+    // Attribute/WhereClause 都是纯数据结构，HIR 直接复用 ast 里的定义，
+    // 不需要另起一套 Hir 版本。
+    pub attributes: Vec<Attribute>,
     pub generic_params: Vec<HirGenericParam>,
     pub target_type: Type,
     pub interface_name: Option<String>,
+    pub where_clause: Vec<WhereClause>,
     pub functions: Vec<HirFn>,
 }
 
 // ===== HIR 表示 interface 定义（同上，补 generic_params）=====
 #[derive(Debug, Clone)]
 pub struct HirInterface {
+    pub attributes: Vec<Attribute>,
     pub name: String,
     pub generic_params: Vec<HirGenericParam>,
     pub methods: Vec<HirFnSig>,
@@ -107,6 +115,9 @@ pub struct HirProgram {
 
 #[derive(Debug, Clone)]
 pub struct HirModel {
+    // 关键新增：同 HirImplement，ast::ModelDef 已有 attributes，HIR
+    // 这层之前一直没接。
+    pub attributes: Vec<Attribute>,
     pub name: String,
     pub generic_params: Vec<HirGenericParam>,
     pub fields: Vec<HirField>,
@@ -125,6 +136,10 @@ pub struct HirField {
 // ===== 补上 generic_params，对应 ast::FnDef 已有的字段，之前 HIR 这层把它丢了 =====
 #[derive(Debug, Clone)]
 pub struct HirFn {
+    // 关键新增：同上，ast::FnDef 已有 attributes（比如 #[effect(...)]、
+    // #[sensitivity(...)] 这些标注最终都要落在这里），HIR 这层之前
+    // 一直没接，效果系统/敏感度分析拿不到这份信息。
+    pub attributes: Vec<Attribute>,
     pub name: String,
     pub generic_params: Vec<HirGenericParam>,
     pub params: Vec<HirParam>,
@@ -171,6 +186,11 @@ pub enum HirStmt {
     Assign { target: Box<HirExpr>, expr: HirExpr, span: Span },
     Loop { body: HirBlock, span: Span },
     Break { span: Span },
+    // 关键新增：对应 ast::Stmt::Continue——语句本身不携带数据，只是
+    // "跳到循环头，进入下一轮"的标记。真正"该跳到哪个块、该给循环头
+    // 哪些 Phi 补一条 incoming"这些语义都在 mir_builder.rs 里落地，
+    // HIR 这一层只负责如实转述"这里有一个 continue"这件事。
+    Continue { span: Span },
     UnsafeBlock { kind: UnsafeKind, body: HirBlock, span: Span },
 }
 
@@ -266,6 +286,13 @@ pub enum HirExprKind {
     },
     // ===== 新增：lack &[T] 空切片字面量，对应 ast::ExprKind::LackSlice =====
     LackSlice(Type),
+    // ===== 新增：取地址 &x / &mut x，对应 ast::ExprKind::Ref =====
+    Ref {
+        mutable: bool,
+        expr: Box<HirExpr>,
+    },
+    // ===== 新增：解引用 *p，对应 ast::ExprKind::Deref =====
+    Deref(Box<HirExpr>),
 }
 
 #[derive(Debug, Clone)]

@@ -17,6 +17,14 @@ use crate::intrinsic::IntrinsicFn;
 pub struct MirProgram {
     pub structs: Vec<MirStruct>,
     pub enums: Vec<MirEnum>,
+    // 关键新增：AST/HIR 一直都有 const/proto/interface 这三种顶层
+    // 声明（HirProgram.consts/protos/interfaces），但 MIR 这一层从
+    // 没接住过——build() 只处理了 models/fns/structs/enums，用户写的
+    // 顶层 const、proto、interface 会被静默丢弃，走到 codegen 那一步
+    // 就凭空消失了，不会报错，只是生成的 Rust 代码里缺了这些声明。
+    pub consts: Vec<MirConst>,
+    pub protos: Vec<MirProto>,
+    pub interfaces: Vec<MirInterface>,
     pub fns: Vec<MirFn>,
     // 保留：codegen 需要知道这次编译实际用到了哪些内建函数，才能决定
     // 要不要在生成的 Rust 里带上对应的运行时支持代码。
@@ -42,6 +50,50 @@ pub struct MirEnum {
     pub name: String,
     pub generic_params: Vec<HirGenericParam>,
     pub variants: Vec<(String, Option<Type>)>,
+}
+
+// 关键新增：对应 HirConst——顶层 `const NAME: T = expr;`。
+// 关键说明（跟 HirConst 不同的地方）：HirConst.value 是一整棵 HirExpr
+// （常量声明右边可以写任意常量表达式），但 MIR 层的三地址码原则要求
+// 右值必须是已经求好值的操作数，不能直接塞一棵表达式树。真正"把
+// HirConst.value 这棵表达式树求值/折叠成一个 MirOperand"这一步，
+// mir_builder.rs 目前还没做（build() 里先占位成 Unit，标了 TODO），
+// 这里的类型定义先把 MIR 层"顶层常量长什么样"这件事定下来。
+#[derive(Debug, Clone)]
+pub struct MirConst {
+    pub name: String,
+    pub ty: Type,
+    pub value: MirOperand,
+}
+
+// 关键新增：对应 HirProto——`proto Name { Variant(T), ... }`，Actor
+// 消息协议的编译期契约声明。落地成 Rust 就是一个普通 enum（见
+// codegen.rs 里对应的生成逻辑），variants 直接复用"变体名 + 可选
+// payload 类型"这个形状，跟 MirEnum.variants 是同一个结构，没必要
+// 另起一套。
+#[derive(Debug, Clone)]
+pub struct MirProto {
+    pub name: String,
+    pub variants: Vec<(String, Option<Type>)>,
+}
+
+// 关键新增：对应 HirFnSig——interface 里每个方法的签名（只有签名，
+// 没有函数体）。
+#[derive(Debug, Clone)]
+pub struct MirFnSig {
+    pub name: String,
+    pub generic_params: Vec<HirGenericParam>,
+    pub params: Vec<(String, Type)>,
+    pub return_type: Option<Type>,
+}
+
+// 关键新增：对应 HirInterface——`interface Name { fn method(...); }`，
+// 落地成 Rust 的 trait。
+#[derive(Debug, Clone)]
+pub struct MirInterface {
+    pub name: String,
+    pub generic_params: Vec<HirGenericParam>,
+    pub methods: Vec<MirFnSig>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,15 +178,27 @@ pub struct SsaLocal {
 // 关键修复：补上 PartialEq——simplify.rs 里 `left == right`（比较两个
 // MirOperand，间接需要 MirPlace 也实现 PartialEq）编译不过，之前只
 // derive 了 Debug/Clone。
+//
+// 关键重构（Sym/Static 搬家）：原来这里有 Static(String) 和
+// Sym(String) 两个变体，是"内建关联常量"（i128::MAX）和"符号形状
+// 引用"（Sym<B> 里的 B）拆开之后各自的落点。但拆开之后再回头看，这
+// 两个变体本来就不该留在 MirPlace 里——MirPlace 的定义是"能被赋值/
+// 取地址的位置"，Ssa/Field/Index/Deref/EnumPayload 都符合这条：可以
+// 出现在赋值左边、可以借用、消耗之后需要 Drop。i128::MAX 和 Sym<B>
+// 一条都不符合：
+//   - 不能被赋值（`i128::MAX = 5;`/`B = 5;` 都没有意义——前者是只读
+//     常量，后者是 model 的超参数，编译期/JIT 期绑定，不是运行时能
+//     写的东西）
+//   - 不能被取地址、不能被 move（它们不指向内存里的字节）
+//   - 不需要 Drop（没有资源）
+// 它们其实是*值*，跟 Literal::Usize(32) 是同一类东西，只是具体数值在
+// 编译期还不知道（Sym）或者是一个有名字的编译期常量（Static）。值该
+// 待在 MirOperand 里，不该套一层 Move/Copy 假装自己是在读某个"位置"。
+// 现在把这两个变体挪到下面 MirOperand 里，跟 Constant 并列。
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirPlace {
     Ssa(SsaLocal),
     Field { base: Box<MirPlace>, field: String },
-    /// 补回：符号/静态引用（比如 Sym<B> 这类形状符号、以后的
-    /// i128::MAX 这类内建关联常量）。Sym 目前在 sema 里还没有真正的
-    /// 符号求解语义（一律按 I32 处理），这里先给它一个干净的落点，
-    /// 不要拿 usize::MAX 这种哨兵值硬凑一个假的 Local id。
-    Static(String),
     /// 新增：索引访问（bytes[i]/arr[i] 这种写法标准库里到处都是，不能
     /// 没有）。索引本身必须是 MirOperand，不是 Box<MirRvalue>——如果索引
     /// 是复杂表达式（比如 arr[i + 1]），i + 1 得先算进一个临时变量，这里
@@ -158,12 +222,38 @@ pub enum MirPlace {
     EnumPayload { base: Box<MirPlace>, enum_name: String, variant_name: String },
 }
 
-// ---- 操作数：读一个左值的值，要么拷贝要么移动，或者是字面量 ----
+// ---- 操作数：读一个左值的值，要么拷贝要么移动，或者是字面量/编译期
+// 已知的符号常量 ----
 #[derive(Debug, Clone, PartialEq)]
 pub enum MirOperand {
     Copy(MirPlace),
     Move(MirPlace),
     Constant(Literal),
+    /// 新增（从 MirPlace::Sym 搬过来，见上面 MirPlace 定义处的说明）：
+    /// 符号形状引用（`Sym<B>` 里的 `B`）。它是一个 usize 值，就像
+    /// `Literal::Usize(32)` 一样，只是具体数值在编译期还不知道，要留到
+    /// JIT 期才能绑定——这正是它不能是 Constant(Literal) 的原因：
+    /// Literal 要求一个编译期就确定的具体值，Sym 没有。
+    /// Sym 目前在 sema 里还没有真正的符号求解语义（一律按 I32
+    /// 处理），这里先给它一个跟内建关联常量干净分开的落点。
+    ///
+    /// **别处需要跟着改的地方（这份文件之外，本次修改没有触达）**：
+    /// codegen.rs 对 MirOperand 的 match 目前大概率是穷尽的（否则新增
+    /// 变体不会导致 E0004），必须补一条 `MirOperand::Sym(name) => ...`
+    /// 分支——在 calc.rs/simplify.rs 真正实现符号求解、决定 Sym<N>
+    /// 该怎么落地（比如降维成一个运行时/JIT 期绑定的标量参数）之前，
+    /// 这条分支至少应该显式报错（"Sym<N> 尚未实现代码生成"）。
+    Sym(String),
+    /// 新增（从 MirPlace::Static 搬过来，见上面 MirPlace 定义处的
+    /// 说明）：内建关联常量（如 i128::MAX、f64::NAN）。codegen 落地成
+    /// `name.clone()` 是对的——这些本来就是 Rust 里合法的、可以裸写
+    /// 的关联常量路径；"字符串是不是合法 Rust 路径"是 codegen 的实现
+    /// 细节，不是 MIR 层该关心的语义，MIR 层它就是一个值。
+    ///
+    /// **别处需要跟着改的地方**：codegen.rs 对 MirOperand 的 match
+    /// 需要补一条 `MirOperand::Static(name) => name.clone()`（把原来
+    /// `MirPlace::Static` 分支的逻辑原样搬过来）。
+    Static(String),
 }
 
 // ---- 右值：能一步算出来的操作，是"拍平"这个词真正的落点 ----
@@ -256,14 +346,24 @@ pub enum MirTerminator {
     Goto(usize),
     If { cond: MirOperand, then_block: usize, else_block: usize },
     Return(Option<MirOperand>),
-    // 对应 Type::Never 落地的地方。ast.rs 已经加上了真正的 Type::Never，
-    // 这个变体不再是先占位的坑——mir_builder.rs 现在会在两处实际用到它：
-    // 1) 函数体正常构建完、终止器仍是占位状态，但函数签名的 return_type
-    //    是 Type::Never（函数本来就声明"不会正常返回"）时，用 Unreachable
-    //    收尾，而不是硬塞一个 Return；
-    // 2) if 表达式里某个分支自身类型是 Type::Never（比如那个分支是一次
-    //    -> never 的调用，如 panic()）时，那个分支块直接标记
-    //    Unreachable，不再假装它会把值 Assign 出来、Goto 到 end_block。
+    // 关键重构（Placeholder/Unreachable 拆分）：这个变体原来还兼职当
+    // "新块默认值/还没决定终止器"用（state.rs::new_block 创建块时给的
+    // 初始值），跟它真正的语义——"已知执行不到这里"（发散之后、match
+    // 穷尽之后……）——完全是两件事，用同一个值表示导致
+    // `current_terminator_is_placeholder()` 这类判断名不副实：它问的
+    // 其实是"这个块的终止器还没被真正设置过"，答案却要靠"terminator
+    // 是不是恰好等于 Unreachable"这个巧合来兜底，一旦真的有代码路径
+    // 需要往一个块里显式写"这里已知不可达"（而不是"还没想好写什么"），
+    // 这两种情况就分不清了。现在两件事拆成两个变体：
+    //   - Unreachable：真正的、已知的"没有下一步"——发散调用之后
+    //     （build_expr_rvalue 里那次 Never 调用）、if/match 分支自身
+    //     发散、所有分支都发散……这些地方设置的是这个变体，语义上
+    //     "这里确实不可达"。
+    //   - Placeholder：纯粹的"还没写"，只有 new_block 会用它初始化，
+    //     任何真正跑完的构建路径最终都应该把它替换成上面某个具体的
+    //     终止器；如果 MIR 里最终还留着一个 Placeholder 没被替换掉，
+    //     那是构建逻辑本身有缺口，不是"这段代码确实到不了这里"。
+    Placeholder,
     Unreachable,
     // 关键修复：这个变体原来在这里断掉了——`Switch { ... }` 自己的花括号
     // 倒是配对了（`default: usize,` 后面那个 `}` 关的是 Switch 这个

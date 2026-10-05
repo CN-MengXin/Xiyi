@@ -1,7 +1,7 @@
 // src/syntactic/parse_item.rs
 use crate::ast::*;
 use crate::token::Token;
-use super::module::Parser;
+use super::Parser;
 
 impl Parser {
     // ===== parse_item：支持所有顶层项 =====
@@ -44,6 +44,13 @@ impl Parser {
             Some((Token::Model, _)) => Ok(vec![Item::ModelDef(self.parse_model(attrs)?)]),
             Some((Token::Implement, _)) => Ok(vec![self.parse_implement_def(attrs)?]),
             Some((Token::Interface, _)) => Ok(vec![self.parse_interface_def(attrs)?]),
+            // 关键新增：AST 里 Item::ProtoDef 早就有了（Actor 消息协议
+            // proto TrainProto { Update(...), QueryWeights, ... }），但
+            // parser 一直没有对应的入口——`proto` 会落到 parse_item 最后
+            // 的兜底分支，报"Expected function, model, implement,
+            // interface, use, struct, enum, or const definition"，
+            // 完全看不出问题出在 proto 没接上。
+            Some((Token::Proto, _)) => Ok(vec![Item::ProtoDef(self.parse_proto_def()?)]),
             Some((Token::Use, _)) => {
                 if !attrs.is_empty() {
                     return Err("Attributes not allowed on use statement".to_string());
@@ -66,28 +73,10 @@ impl Parser {
     }
 
     // ===== parse_use_item =====
-    // 路径的第一段除了普通标识符，还可能是 crate/super/here 这三个路径
-    // 关键字（crate:: 当前 crate 根、super:: 父模块、here:: 当前模块）。
-    // 只有第一段会是这几个词，后续路径段（crate::iter::Iterator 里的
-    // iter、Iterator）永远是普通标识符，不用特殊处理。
-    pub(crate) fn parse_path_root(&mut self) -> Result<String, String> {
-        match self.peek() {
-            Some((Token::Crate, _)) => {
-                self.next();
-                Ok("crate".to_string())
-            }
-            Some((Token::Super, _)) => {
-                self.next();
-                Ok("super".to_string())
-            }
-            Some((Token::Here, _)) => {
-                self.next();
-                Ok("here".to_string())
-            }
-            _ => self.parse_ident(),
-        }
-    }
-
+    // 路径读取的原语（读第一段、判断/消费 ::）挪进了 parse_path.rs，
+    // 这里只保留 use 语句自己特有的部分：花括号多导入展开、别名、
+    // 结尾分号。parse_path_root() 仍然是 self 上的方法，只是定义
+    // 挪了个文件，调用方式不用变。
     pub(crate) fn parse_use_item(&mut self) -> Result<Vec<Item>, String> {
         let mut parts = Vec::new();
         let first = self.parse_path_root()?;
@@ -147,59 +136,75 @@ impl Parser {
             Vec::new()
         };
         // 从这里开始，target_type/interface_name/where_clause/函数体全都可能
-        // 引用到自己声明的泛型参数（比如 `implement<T> Container<T>`），必须
-        // 在解析 target_type 之前就把作用域压进去。
-        self.push_generic_scope(&generic_params);
+        // 引用到自己声明的泛型参数（比如 `implement<T> Container<T>`）。原来
+        // 这里手写 push_generic_scope 开头、pop_generic_scope 结尾，中间一整
+        // 段全是会用 `?` 直接甩错误的解析代码——任何一步失败都会跳过结尾的
+        // pop，让作用域永久残留，污染后续所有解析。改成 with_generic_scope：
+        // 闭包内部想失败就正常 Err、想成功就正常 Ok，pop 由它自己无条件执行
+        // 一次，不用在每条错误路径上都惦记着手动收尾（之前给"interface 名字
+        // 缺失"和"游离 '('"这两条错误路径手写的 pop_generic_scope() 调用，
+        // 现在也不再需要，一并去掉）。
+        //
+        // 闭包只把中间这段可能失败的解析结果（target_type/interface_name/
+        // where_clause/functions）传出来，attributes 和 generic_params 留在
+        // 外层、等 with_generic_scope 返回之后再用来拼最终的 ImplementDef——
+        // 这样不需要为了"闭包内外都要用一份 generic_params"而去 clone 它
+        // （没法确定 GenericParam 有没有派生 Clone，没必要冒这个风险）。
+        let (target_type, interface_name, where_clause, functions) =
+            self.with_generic_scope(&generic_params, |this| {
+                // ===== implement X for Y 里 X/Y 谁是谁 =====
+                // 规范（docx §6.2）写得很明确：
+                //     implement Drawable for Point { ... }
+                // Drawable 是接口名，Point 才是被实现的目标类型——"for" 前面是
+                // 接口，后面是目标。但这里没法在看到 "for" 之前就知道第一段该
+                // 按哪种身份解析（`implement<T> Container<T> { ... }` 完全没有
+                // "for"，第一段直接就是目标类型），只能先按"类型"解析出第一
+                // 段，再看后面有没有 "for" 来决定：没有 "for"，第一段就是目标
+                // 类型（固有实现）；有 "for"，说明第一段其实是接口名，"for"
+                // 后面那个才是真正的目标类型。
+                let first_type = this.parse_type()?;
 
-        // ===== implement X for Y 里 X/Y 谁是谁 =====
-        // 规范（docx §6.2）写得很明确：
-        //     implement Drawable for Point { ... }
-        // Drawable 是接口名，Point 才是被实现的目标类型——"for" 前面是接口，
-        // 后面是目标。但这里没法在看到 "for" 之前就知道第一段该按哪种身份
-        // 解析（`implement<T> Container<T> { ... }` 完全没有 "for"，第一段
-        // 直接就是目标类型），只能先按"类型"解析出第一段，再看后面有没有
-        // "for" 来决定：没有 "for"，第一段就是目标类型（固有实现）；有
-        // "for"，说明第一段其实是接口名，"for" 后面那个才是真正的目标类型。
-        let first_type = self.parse_type()?;
+                let (target_type, interface_name) = if let Some((Token::For, _)) = this.peek() {
+                    this.next(); // consume 'for'
+                    let interface_name = match &first_type {
+                        Type::Struct(name) => name.clone(),
+                        Type::Generic(name, _) => name.clone(),
+                        _ => return Err("Expected interface name before 'for'".to_string()),
+                    };
+                    let target_type = this.parse_type()?;
+                    (target_type, Some(interface_name))
+                } else {
+                    (first_type, None)
+                };
 
-        let (target_type, interface_name) = if let Some((Token::For, _)) = self.peek() {
-            self.next(); // consume 'for'
-            let interface_name = match &first_type {
-                Type::Struct(name) => name.clone(),
-                Type::Generic(name, _) => name.clone(),
-                _ => {
-                    self.pop_generic_scope();
-                    return Err("Expected interface name before 'for'".to_string());
+                let where_clause = if let Some((Token::Where, _)) = this.peek() {
+                    this.next();
+                    this.parse_where_clause()?
+                } else {
+                    Vec::new()
+                };
+
+                // implement 头部到这里只应该紧跟 '{'，任何 '(' 都意味着用户
+                // 写错了（比如多打了一个括号），必须直接报错，不能悄悄吃掉
+                // 继续解析（那样只会得到一棵语义已经跑偏的 AST）。
+                if let Some((Token::LParen, _)) = this.peek() {
+                    return Err(format!(
+                        "Unexpected '(' after implement header at pos {}",
+                        this.pos
+                    ));
                 }
-            };
-            let target_type = self.parse_type()?;
-            (target_type, Some(interface_name))
-        } else {
-            (first_type, None)
-        };
 
-        let where_clause = if let Some((Token::Where, _)) = self.peek() {
-            self.next();
-            self.parse_where_clause()?
-        } else {
-            Vec::new()
-        };
+                this.expect(Token::LBrace)?;
+                let mut functions = Vec::new();
+                while let Some((token, _)) = this.peek() {
+                    if *token == Token::RBrace { break; }
+                    let fn_attrs = this.parse_attributes()?;
+                    functions.push(this.parse_func_def(fn_attrs)?);
+                }
+                this.expect(Token::RBrace)?;
 
-        // 跳过可能残留的 '('
-        while let Some((Token::LParen, _)) = self.peek() {
-            eprintln!("Skipping stray LParen at position {}", self.pos);
-            self.next();
-        }
-
-        self.expect(Token::LBrace)?;
-        let mut functions = Vec::new();
-        while let Some((token, _)) = self.peek() {
-            if *token == Token::RBrace { break; }
-            let fn_attrs = self.parse_attributes()?;
-            functions.push(self.parse_func_def(fn_attrs)?);
-        }
-        self.expect(Token::RBrace)?;
-        self.pop_generic_scope();
+                Ok((target_type, interface_name, where_clause, functions))
+            })?;
 
         Ok(Item::Implement(ImplementDef {
             attributes,
@@ -221,16 +226,23 @@ impl Parser {
         } else {
             Vec::new()
         };
-        self.push_generic_scope(&generic_params);
 
-        self.expect(Token::LBrace)?;
-        let mut methods = Vec::new();
-        while let Some((token, _)) = self.peek() {
-            if *token == Token::RBrace { break; }
-            methods.push(self.parse_func_sig()?);
-        }
-        self.expect(Token::RBrace)?;
-        self.pop_generic_scope();
+        // 跟 parse_implement_def 一样的问题：原来 push_generic_scope 开头、
+        // pop_generic_scope 结尾，中间 expect(LBrace)/methods 循环/
+        // expect(RBrace) 任何一步失败都会漏掉结尾的 pop。改用
+        // with_generic_scope，收尾保证执行；闭包只返回 methods，
+        // attributes/name/generic_params 留在外层，出了闭包再拼
+        // InterfaceDef，不需要 clone generic_params。
+        let methods = self.with_generic_scope(&generic_params, |this| {
+            this.expect(Token::LBrace)?;
+            let mut methods = Vec::new();
+            while let Some((token, _)) = this.peek() {
+                if *token == Token::RBrace { break; }
+                methods.push(this.parse_func_sig()?);
+            }
+            this.expect(Token::RBrace)?;
+            Ok(methods)
+        })?;
 
         Ok(Item::Interface(InterfaceDef {
             attributes,
@@ -238,6 +250,42 @@ impl Parser {
             generic_params,
             methods,
         }))
+    }
+
+    // ===== parse_proto_def =====
+    // proto 定义 Actor 的编译期消息接口契约：一串变体，每个变体可选
+    // 携带一个参数类型（`Update(Gradient<...>)`）或者不带参数
+    // （`QueryWeights`）。结构上跟 enum 很像（都是"一串带名字、可选
+    // 带一个类型参数的变体"），但语义完全不同（proto 是 Actor 消息
+    // 协议，不是数据类型），AST 里 ProtoDef/ProtoVariant 也是独立的
+    // 结构体，不是复用 EnumDef/EnumVariant，这里也不去共享解析函数，
+    // 照 EnumDef 的读法单独写一份，保持"这是 proto，不是 enum"的界限
+    // 清楚。
+    pub(crate) fn parse_proto_def(&mut self) -> Result<ProtoDef, String> {
+        self.expect(Token::Proto)?;
+        let name = self.parse_ident()?;
+        self.expect(Token::LBrace)?;
+        let mut variants = Vec::new();
+        while let Some((token, _)) = self.peek() {
+            if *token == Token::RBrace {
+                break;
+            }
+            let variant_name = self.parse_ident()?;
+            let ty = if let Some((Token::LParen, _)) = self.peek() {
+                self.next();
+                let t = self.parse_type()?;
+                self.expect(Token::RParen)?;
+                Some(t)
+            } else {
+                None
+            };
+            variants.push(ProtoVariant { name: variant_name, ty });
+            if let Some((Token::Comma, _)) = self.peek() {
+                self.next();
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(ProtoDef { name, variants })
     }
 
     // ===== parse_struct_def（支持泛型） =====
@@ -251,29 +299,34 @@ impl Parser {
         } else {
             Vec::new()
         };
-        self.push_generic_scope(&generic_params);
 
-        self.expect(Token::LBrace)?;
-        let mut fields = Vec::new();
+        // 同上：字段类型可能引用到自己声明的泛型参数，中间任何一步
+        // 失败都不能漏掉 pop，改用 with_generic_scope；闭包只返回
+        // fields，name/generic_params 留在外层再拼 StructDef。
+        let fields = self.with_generic_scope(&generic_params, |this| {
+            this.expect(Token::LBrace)?;
+            let mut fields = Vec::new();
 
-        while let Some((token, _)) = self.peek() {
-            if *token == Token::RBrace { break; }
-            let field_name = self.parse_ident()?;
-            self.expect(Token::Colon)?;
-            let ty = self.parse_type()?;
-            fields.push(StructField { name: field_name, ty });
-            match self.peek() {
-                Some((Token::Comma, _)) => {
-                    self.next();
-                    if let Some((Token::RBrace, _)) = self.peek() { break; }
+            while let Some((token, _)) = this.peek() {
+                if *token == Token::RBrace { break; }
+                let field_name = this.parse_ident()?;
+                this.expect(Token::Colon)?;
+                let ty = this.parse_type()?;
+                fields.push(StructField { name: field_name, ty });
+                match this.peek() {
+                    Some((Token::Comma, _)) => {
+                        this.next();
+                        if let Some((Token::RBrace, _)) = this.peek() { break; }
+                    }
+                    Some((Token::RBrace, _)) => break,
+                    _ => return Err("Expected comma or closing brace".to_string()),
                 }
-                Some((Token::RBrace, _)) => break,
-                _ => return Err("Expected comma or closing brace".to_string()),
             }
-        }
 
-        self.expect(Token::RBrace)?;
-        self.pop_generic_scope();
+            this.expect(Token::RBrace)?;
+            Ok(fields)
+        })?;
+
         Ok(StructDef {
             name,
             generic_params,
@@ -292,38 +345,42 @@ impl Parser {
         } else {
             Vec::new()
         };
-        self.push_generic_scope(&generic_params);
 
-        self.expect(Token::LBrace)?;
-        let mut variants = Vec::new();
+        // 同上：变体携带的类型可能引用到自己声明的泛型参数，改用
+        // with_generic_scope 保证收尾；闭包只返回 variants。
+        let variants = self.with_generic_scope(&generic_params, |this| {
+            this.expect(Token::LBrace)?;
+            let mut variants = Vec::new();
 
-        while let Some((token, _)) = self.peek() {
-            if *token == Token::RBrace { break; }
-            let variant_name = self.parse_ident()?;
+            while let Some((token, _)) = this.peek() {
+                if *token == Token::RBrace { break; }
+                let variant_name = this.parse_ident()?;
 
-            let ty = if let Some((Token::LParen, _)) = self.peek() {
-                self.next();
-                let param_ty = self.parse_type()?;
-                self.expect(Token::RParen)?;
-                Some(param_ty)
-            } else {
-                None
-            };
+                let ty = if let Some((Token::LParen, _)) = this.peek() {
+                    this.next();
+                    let param_ty = this.parse_type()?;
+                    this.expect(Token::RParen)?;
+                    Some(param_ty)
+                } else {
+                    None
+                };
 
-            variants.push(EnumVariant { name: variant_name, ty });
+                variants.push(EnumVariant { name: variant_name, ty });
 
-            match self.peek() {
-                Some((Token::Comma, _)) => {
-                    self.next();
-                    if let Some((Token::RBrace, _)) = self.peek() { break; }
+                match this.peek() {
+                    Some((Token::Comma, _)) => {
+                        this.next();
+                        if let Some((Token::RBrace, _)) = this.peek() { break; }
+                    }
+                    Some((Token::RBrace, _)) => break,
+                    _ => return Err("Expected comma or closing brace".to_string()),
                 }
-                Some((Token::RBrace, _)) => break,
-                _ => return Err("Expected comma or closing brace".to_string()),
             }
-        }
 
-        self.expect(Token::RBrace)?;
-        self.pop_generic_scope();
+            this.expect(Token::RBrace)?;
+            Ok(variants)
+        })?;
+
         Ok(EnumDef {
             name,
             generic_params,

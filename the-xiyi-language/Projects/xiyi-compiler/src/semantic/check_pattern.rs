@@ -22,11 +22,6 @@ impl TypeChecker {
             .ok_or_else(|| format!("undefined enum: {}", enum_name))?
             .clone();
 
-        // 预先收集变体名称
-        let variant_names: Vec<String> = enum_def.variants.iter()
-            .map(|v| v.name.clone())
-            .collect();
-
         let mut arm_types = Vec::new();
         for arm in &match_expr.arms {
             self.scopes.push(HashMap::new());
@@ -36,7 +31,7 @@ impl TypeChecker {
                     if pat_enum != &enum_name {
                         return Err("pattern enum name mismatch".to_string());
                     }
-                    if !variant_names.contains(variant_name) {
+                    if !self.has_variant(&enum_name, variant_name) {
                         return Err(format!("enum {} has no variant {}", enum_name, variant_name));
                     }
                 }
@@ -44,30 +39,35 @@ impl TypeChecker {
                     if pat_enum != &enum_name {
                         return Err("pattern enum name mismatch".to_string());
                     }
-                    if !variant_names.contains(variant_name) {
-                        return Err(format!("enum {} has no variant {}", enum_name, variant_name));
-                    }
-
-                    let variant = enum_def.variants.iter()
-                        .find(|v| v.name == *variant_name)
-                        .ok_or_else(|| format!("variant not found"))?;
+                    // 合并原来"contains 检查 + find 取值"两次查找为一次——
+                    // 原来那次 contains 通过之后，find 必然成功，
+                    // `ok_or_else(|| "variant not found")` 是永远不会走到
+                    // 的死代码。
+                    let variant = self.resolve_variant_in(&enum_name, variant_name)
+                        .ok_or_else(|| format!("enum {} has no variant {}", enum_name, variant_name))?;
 
                     // ===== binding_ty 推断逻辑 =====
+                    // 关键修复：原来这里硬编码"泛型参数名字必须叫 T"，
+                    // `enum Result<T, E> { Ok(T), Err(E) }` 里 Ok(x) 能
+                    // 推到（名字碰巧是 T），但 Err(e) 推不出来——payload
+                    // 类型是 Type::Struct("E")，两个分支都对不上 "T"，
+                    // 落到 `_ => param_ty.clone()`，绑定成裸的 Struct("E")
+                    // 而不是调用点实际传入的类型。改成不按名字猜，用
+                    // enum_def.generic_params 查出真正的参数名列表和
+                    // 下标，payload 类型如果恰好是某个参数名本身，就用
+                    // generic_args 里对应位置的实参替换——这样 Err 是
+                    // 枚举第 1 个（下标 1）泛型参数也能正确处理，不再
+                    // 只能处理第 0 个。
+                    let param_names = Self::generic_param_names(&enum_def.generic_params);
                     let binding_ty = if let Some(param_ty) = &variant.ty {
                         match param_ty {
-                            // 泛型占位符 T（以 Struct 或 Generic 形式出现）
-                            Type::Struct(name) if name == "T" => {
-                                if let Some(real_ty) = generic_args.get(0) {
-                                    real_ty.clone()
+                            Type::Struct(name) | Type::Generic(name, _) => {
+                                if let Some(idx) = param_names.iter().position(|n| n == name) {
+                                    generic_args.get(idx).cloned().ok_or_else(|| {
+                                        format!("missing generic argument for `{}`", name)
+                                    })?
                                 } else {
-                                    return Err("missing generic argument".to_string());
-                                }
-                            }
-                            Type::Generic(name, _) if name == "T" => {
-                                if let Some(real_ty) = generic_args.get(0) {
-                                    real_ty.clone()
-                                } else {
-                                    return Err("missing generic argument".to_string());
+                                    param_ty.clone()
                                 }
                             }
                             _ => param_ty.clone(),
